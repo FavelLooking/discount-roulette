@@ -1,0 +1,18 @@
+{
+  "albums": [
+    306956094,
+    276002608,
+    305749292,
+    304861180,
+    304864849,
+    304864812,
+    304864700,
+    276003115
+  ],
+  "discountPercent": 25,
+  "itemsPerPost": 9,
+  "scheduledPostsCount": 10,
+  "publishTime": "20:30",
+  "centerImageAttachment": "",
+  "excludeWords": ["продано", "бронь", "sold", "нет в наличии"]
+}
