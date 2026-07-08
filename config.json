@@ -10,8 +10,15 @@
     276003115
   ],
   "discountPercent": 25,
-  "itemsPerPost": 9,
+  "itemsPerPost": 8,
   "scheduledPostsCount": 10,
+  "queueDays": 5,
+  "testQueuePosts": 0,
+  "queueRunHour": 17,
+  "queueRunMinute": 0,
+  "candidatePoolSize": 30,
+  "reuseAfterDays": 120,
+  "legacyScanAutoPadding": true,
   "publishTime": "20:30",
   "centerImageAttachment": "",
   "excludeWords": ["продано", "бронь", "sold", "нет в наличии"]

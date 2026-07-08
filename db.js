@@ -70,11 +70,25 @@ function openDb() {
 
     CREATE INDEX IF NOT EXISTS idx_reservations_vk_post_id
       ON reservations(vk_post_id);
+
+    CREATE TABLE IF NOT EXISTS used_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      photo_attachment TEXT,
+      photo_id INTEGER,
+      vk_post_id INTEGER,
+      used_at INTEGER,
+      state TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_used_items_photo_attachment
+      ON used_items(photo_attachment);
   `);
 
   const reservationColumns = db.prepare('PRAGMA table_info(reservations)').all();
   const hasReplySentAt = reservationColumns.some((column) => column.name === 'reply_sent_at');
   const hasDisplayName = reservationColumns.some((column) => column.name === 'display_name');
+  const usedItemColumns = db.prepare('PRAGMA table_info(used_items)').all();
+  const hasUsedItemState = usedItemColumns.some((column) => column.name === 'state');
 
   if (!hasReplySentAt) {
     db.exec('ALTER TABLE reservations ADD COLUMN reply_sent_at INTEGER');
@@ -84,10 +98,56 @@ function openDb() {
     db.exec('ALTER TABLE reservations ADD COLUMN display_name TEXT');
   }
 
+  if (!hasUsedItemState) {
+    db.exec('ALTER TABLE used_items ADD COLUMN state TEXT');
+  }
+
+  db.exec(`
+    UPDATE used_items
+    SET state = COALESCE((
+      SELECT
+        CASE
+          WHEN scheduled_posts.status = 'published' THEN 'published'
+          WHEN scheduled_posts.status = 'deleted' THEN 'deleted'
+          ELSE 'scheduled'
+        END
+      FROM scheduled_posts
+      WHERE scheduled_posts.vk_post_id = used_items.vk_post_id
+    ), 'scheduled')
+    WHERE state IS NULL;
+  `);
+
   return db;
 }
 
 const db = openDb();
+
+function insertUsedItems(vkPostId, items, usedAt = Math.floor(Date.now() / 1000), state = 'scheduled') {
+  const insertUsedItem = db.prepare(`
+    INSERT INTO used_items (
+      photo_attachment,
+      photo_id,
+      vk_post_id,
+      used_at,
+      state
+    ) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(photo_attachment) DO UPDATE SET
+      photo_id = excluded.photo_id,
+      vk_post_id = excluded.vk_post_id,
+      used_at = excluded.used_at,
+      state = excluded.state
+  `);
+
+  items.forEach((item) => {
+    insertUsedItem.run(
+      item.photoAttachment,
+      item.photoId,
+      vkPostId,
+      usedAt,
+      state,
+    );
+  });
+}
 
 function saveScheduledPost({ vkPostId, publishDate, publishDateText, items }) {
   const existing = db.prepare('SELECT id FROM scheduled_posts WHERE vk_post_id = ?').get(vkPostId);
@@ -147,6 +207,8 @@ function saveScheduledPost({ vkPostId, publishDate, publishDateText, items }) {
         item.photoText,
       );
     });
+
+    insertUsedItems(vkPostId, items, publishDate);
   });
 
   transaction();
@@ -367,6 +429,98 @@ function replacePostItems(vkPostId, items) {
   transaction();
 }
 
+function getUsedPhotoAttachments() {
+  return db.prepare(`
+    SELECT photo_attachment
+    FROM used_items
+  `).all().map((row) => row.photo_attachment);
+}
+
+function getUsedPhotoHistory() {
+  return db.prepare(`
+    SELECT
+      photo_attachment,
+      used_at,
+      state
+    FROM used_items
+    WHERE photo_attachment IS NOT NULL
+  `).all();
+}
+
+function markPostItemsState(vkPostId, state, usedAt = Math.floor(Date.now() / 1000)) {
+  const items = getPostItems(vkPostId).map((item) => ({
+    photoAttachment: item.photo_attachment,
+    photoId: item.photo_id,
+  }));
+
+  insertUsedItems(vkPostId, items, usedAt, state);
+}
+
+const markScheduledPostDeletedTransaction = db.transaction((vkPostId) => {
+  const post = getScheduledPost(vkPostId);
+
+  if (!post) {
+    return {
+      updated: false,
+      reason: 'not_found',
+    };
+  }
+
+  db.prepare(`
+    UPDATE scheduled_posts
+    SET status = 'deleted'
+    WHERE vk_post_id = ?
+  `).run(vkPostId);
+
+  return {
+    updated: true,
+  };
+});
+
+function markScheduledPostDeleted(vkPostId) {
+  return markScheduledPostDeletedTransaction(vkPostId);
+}
+
+const resetTestPostsTransaction = db.transaction(() => {
+  const posts = db.prepare(`
+    SELECT vk_post_id
+    FROM scheduled_posts
+    WHERE status = 'deleted'
+  `).all();
+  const deletePostItems = db.prepare('DELETE FROM post_items WHERE vk_post_id = ?');
+  const deleteUsedItems = db.prepare('DELETE FROM used_items WHERE vk_post_id = ?');
+  const deleteScheduledPost = db.prepare('DELETE FROM scheduled_posts WHERE vk_post_id = ?');
+
+  posts.forEach((post) => {
+    deletePostItems.run(post.vk_post_id);
+    deleteUsedItems.run(post.vk_post_id);
+    deleteScheduledPost.run(post.vk_post_id);
+  });
+
+  return {
+    deletedPosts: posts.map((post) => post.vk_post_id),
+  };
+});
+
+function resetTestPosts() {
+  return resetTestPostsTransaction();
+}
+
+function getUsedItemsSummary() {
+  const rows = db.prepare(`
+    SELECT
+      state,
+      COUNT(*) AS count
+    FROM used_items
+    GROUP BY state
+  `).all();
+
+  return rows.reduce((summary, row) => {
+    summary[row.state || 'scheduled'] = row.count;
+    return summary;
+  }, {});
+}
+
 function getReservationByCommentId(vkPostId, commentId) {
   return db.prepare(`
     SELECT
@@ -495,6 +649,12 @@ module.exports = {
   listPostsForReservationFixByIds,
   getPostItems,
   replacePostItems,
+  getUsedPhotoAttachments,
+  getUsedPhotoHistory,
+  markPostItemsState,
+  markScheduledPostDeleted,
+  resetTestPosts,
+  getUsedItemsSummary,
   getReservationByCommentId,
   saveReservation,
   updateReservationResolved,

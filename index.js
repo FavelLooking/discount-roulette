@@ -17,6 +17,11 @@ const {
   listPostsForReservationFixByIds,
   getPostItems,
   replacePostItems,
+  getUsedPhotoHistory,
+  markPostItemsState,
+  markScheduledPostDeleted,
+  resetTestPosts,
+  getUsedItemsSummary,
   getReservationByCommentId,
   saveReservation,
   updateReservationResolved,
@@ -45,6 +50,14 @@ const CELL_GAP = 6;
 const HEADER_HEIGHT = 0;
 const CARD_WIDTH = Math.floor((PREVIEW_WIDTH - SAFE_PADDING * 2 - CELL_GAP * 2) / 3);
 const CARD_HEIGHT = Math.floor((PREVIEW_HEIGHT - SAFE_PADDING * 2 - CELL_GAP * 2) / 3);
+const LEGACY_SCAN_BORDER_THRESHOLD = 10;
+const LEGACY_SCAN_SCALE = 0.94;
+const WHITE_PIXEL_THRESHOLD = 235;
+const WHITE_LINE_RATIO = 0.82;
+const COMIC_BBOX_SAMPLE_SIZE = 360;
+const COMIC_BBOX_BACKGROUND_DISTANCE = 38;
+const COMIC_BBOX_MIN_AREA_RATIO = 0.18;
+const COMIC_BBOX_CROP_PADDING_RATIO = 0.025;
 
 function getReadTokenName() {
   return 'VK_USER_TOKEN';
@@ -331,14 +344,14 @@ function buildImportedPostItems(post) {
   const pricesByNumber = parsePostPriceLines(post.text || '');
   const photos = getWallPostPhotoAttachments(post);
   logPostPhotoAttachments(post, photos);
-  const productPhotos = photos.slice(1, 10);
+  const productPhotos = photos.slice(1, 9);
 
   if (pricesByNumber.size === 0) {
     console.warn(`Warning: prices were not parsed for post ${post.id}`);
   }
 
-  if (productPhotos.length < 9) {
-    console.warn(`Expected 9 product photos, found ${productPhotos.length}`);
+  if (productPhotos.length < 8) {
+    console.warn(`Expected 8 product photos, found ${productPhotos.length}`);
   }
 
   return productPhotos.map((photo, index) => {
@@ -413,16 +426,19 @@ async function syncRecentRoulettePosts() {
 
     if (result.saved) {
       console.log(`Imported post ${post.id}: ${items.length} items`);
+      markPostItemsState(post.id, 'published', post.date);
     } else if (result.reason === 'duplicate') {
       console.log(`Post ${post.id} already exists, skipped`);
       const existingItems = getPostItems(post.id);
 
-      if (existingItems.length < 9) {
+      if (existingItems.length < 8) {
         console.warn(`post_items less than 9 for post ${post.id}, reimporting`);
         items = buildImportedPostItems(post);
         replacePostItems(post.id, items);
         console.log(`Reimported post ${post.id}: ${items.length} items`);
       }
+
+      markPostItemsState(post.id, 'published', post.date);
     }
 
     await waitToAvoidVkRateLimit(2000);
@@ -1135,7 +1151,7 @@ async function getAllAvailableItems(albumIds) {
 }
 
 function buildScheduledPostPlans(products, options = {}) {
-  const itemsPerPost = Number(options.itemsPerPost || 9);
+  const itemsPerPost = Number(options.itemsPerPost || 8);
   const scheduledPostsCount = Number(options.scheduledPostsCount || 1);
   const publishTime = options.publishTime || '20:30';
   const neededItemsCount = itemsPerPost * scheduledPostsCount;
@@ -1231,12 +1247,286 @@ async function downloadItemImage(item) {
   throw new Error(`Не удалось скачать изображение для ${item.attachment}: ${lastError.message || lastError}`);
 }
 
+function isWhitePixel(data, offset, channels) {
+  return data[offset] >= WHITE_PIXEL_THRESHOLD
+    && data[offset + 1] >= WHITE_PIXEL_THRESHOLD
+    && data[offset + 2] >= WHITE_PIXEL_THRESHOLD
+    && (channels < 4 || data[offset + 3] >= WHITE_PIXEL_THRESHOLD);
+}
+
+function getColumnWhiteRatio(data, width, height, channels, x) {
+  let whitePixels = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    const offset = (y * width + x) * channels;
+
+    if (isWhitePixel(data, offset, channels)) {
+      whitePixels += 1;
+    }
+  }
+
+  return whitePixels / height;
+}
+
+function getRowWhiteRatio(data, width, channels, y) {
+  let whitePixels = 0;
+
+  for (let x = 0; x < width; x += 1) {
+    const offset = (y * width + x) * channels;
+
+    if (isWhitePixel(data, offset, channels)) {
+      whitePixels += 1;
+    }
+  }
+
+  return whitePixels / width;
+}
+
+function countWhiteBorderFromStart(length, maxScan, getRatio) {
+  let thickness = 0;
+
+  for (let index = 0; index < maxScan && index < length; index += 1) {
+    if (getRatio(index) < WHITE_LINE_RATIO) {
+      break;
+    }
+
+    thickness += 1;
+  }
+
+  return thickness;
+}
+
+async function getWhiteBorderThickness(buffer) {
+  const { data, info } = await sharp(buffer)
+    .rotate()
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  const maxHorizontalScan = Math.min(80, Math.floor(width / 3));
+  const maxVerticalScan = Math.min(80, Math.floor(height / 3));
+
+  return {
+    left: countWhiteBorderFromStart(width, maxHorizontalScan, (x) => getColumnWhiteRatio(data, width, height, channels, x)),
+    right: countWhiteBorderFromStart(width, maxHorizontalScan, (x) => getColumnWhiteRatio(data, width, height, channels, width - 1 - x)),
+    top: countWhiteBorderFromStart(height, maxVerticalScan, (y) => getRowWhiteRatio(data, width, channels, y)),
+    bottom: countWhiteBorderFromStart(height, maxVerticalScan, (y) => getRowWhiteRatio(data, width, channels, height - 1 - y)),
+  };
+}
+
+function isLegacyScanBorder(border) {
+  return Math.max(border.left, border.right, border.top, border.bottom) < LEGACY_SCAN_BORDER_THRESHOLD;
+}
+
+async function addLegacyScanPadding(buffer) {
+  const metadata = await sharp(buffer).metadata();
+  const width = metadata.width || CARD_WIDTH;
+  const height = metadata.height || CARD_HEIGHT;
+  const innerWidth = Math.round(width * LEGACY_SCAN_SCALE);
+  const innerHeight = Math.round(height * LEGACY_SCAN_SCALE);
+  const resized = await sharp(buffer)
+    .resize(innerWidth, innerHeight, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 94 })
+    .toBuffer();
+  const resizedMetadata = await sharp(resized).metadata();
+
+  return sharp({
+    create: {
+      width,
+      height,
+      channels: 3,
+      background: '#ffffff',
+    },
+  })
+    .composite([{
+      input: resized,
+      left: Math.round((width - (resizedMetadata.width || innerWidth)) / 2),
+      top: Math.round((height - (resizedMetadata.height || innerHeight)) / 2),
+    }])
+    .jpeg({ quality: 94 })
+    .toBuffer();
+}
+
+function getPixelColor(data, width, channels, x, y) {
+  const offset = (y * width + x) * channels;
+
+  return [
+    data[offset],
+    data[offset + 1],
+    data[offset + 2],
+  ];
+}
+
+function averageColors(colors) {
+  const result = colors.reduce((acc, color) => [
+    acc[0] + color[0],
+    acc[1] + color[1],
+    acc[2] + color[2],
+  ], [0, 0, 0]);
+
+  return result.map((value) => value / colors.length);
+}
+
+function colorDistance(a, b) {
+  const red = a[0] - b[0];
+  const green = a[1] - b[1];
+  const blue = a[2] - b[2];
+
+  return Math.sqrt(red * red + green * green + blue * blue);
+}
+
+function sampleCornerBackgrounds(data, width, height, channels) {
+  const insetX = Math.max(0, Math.floor(width * 0.035));
+  const insetY = Math.max(0, Math.floor(height * 0.035));
+  const maxX = width - 1;
+  const maxY = height - 1;
+
+  return [
+    getPixelColor(data, width, channels, insetX, insetY),
+    getPixelColor(data, width, channels, maxX - insetX, insetY),
+    getPixelColor(data, width, channels, insetX, maxY - insetY),
+    getPixelColor(data, width, channels, maxX - insetX, maxY - insetY),
+    averageColors([
+      getPixelColor(data, width, channels, insetX, insetY),
+      getPixelColor(data, width, channels, maxX - insetX, insetY),
+      getPixelColor(data, width, channels, insetX, maxY - insetY),
+      getPixelColor(data, width, channels, maxX - insetX, maxY - insetY),
+    ]),
+  ];
+}
+
+async function detectComicBoundingBox(buffer) {
+  const originalMetadata = await sharp(buffer).metadata();
+  const originalWidth = originalMetadata.width || 0;
+  const originalHeight = originalMetadata.height || 0;
+
+  if (!originalWidth || !originalHeight) {
+    return null;
+  }
+
+  const sampleWidth = Math.min(COMIC_BBOX_SAMPLE_SIZE, originalWidth);
+  const sampleHeight = Math.round(originalHeight * (sampleWidth / originalWidth));
+  const { data, info } = await sharp(buffer)
+    .rotate()
+    .resize(sampleWidth, sampleHeight, { fit: 'inside' })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height, channels } = info;
+  const backgrounds = sampleCornerBackgrounds(data, width, height, channels);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  let foregroundPixels = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const color = getPixelColor(data, width, channels, x, y);
+      const nearestBackgroundDistance = Math.min(...backgrounds.map((background) => colorDistance(color, background)));
+
+      if (nearestBackgroundDistance <= COMIC_BBOX_BACKGROUND_DISTANCE) {
+        continue;
+      }
+
+      foregroundPixels += 1;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+
+  const bboxWidth = maxX - minX + 1;
+  const bboxHeight = maxY - minY + 1;
+  const bboxAreaRatio = (bboxWidth * bboxHeight) / (width * height);
+
+  if (bboxAreaRatio < COMIC_BBOX_MIN_AREA_RATIO || foregroundPixels < width * height * 0.08) {
+    return null;
+  }
+
+  const scaleX = originalWidth / width;
+  const scaleY = originalHeight / height;
+  const padding = Math.round(Math.min(originalWidth, originalHeight) * COMIC_BBOX_CROP_PADDING_RATIO);
+  const left = Math.max(0, Math.floor(minX * scaleX) - padding);
+  const top = Math.max(0, Math.floor(minY * scaleY) - padding);
+  const right = Math.min(originalWidth, Math.ceil((maxX + 1) * scaleX) + padding);
+  const bottom = Math.min(originalHeight, Math.ceil((maxY + 1) * scaleY) + padding);
+  const cropWidth = right - left;
+  const cropHeight = bottom - top;
+
+  if (cropWidth >= originalWidth * 0.985 && cropHeight >= originalHeight * 0.985) {
+    return null;
+  }
+
+  return {
+    left,
+    top,
+    width: cropWidth,
+    height: cropHeight,
+  };
+}
+
+async function centerComicInPhoto(buffer, item) {
+  try {
+    const bbox = await detectComicBoundingBox(buffer);
+
+    if (!bbox) {
+      return buffer;
+    }
+
+    if (DRY_RUN) {
+      console.log(`Comic bbox centered: ${item.attachment} (${bbox.left},${bbox.top},${bbox.width}x${bbox.height})`);
+    }
+
+    return sharp(buffer)
+      .rotate()
+      .extract(bbox)
+      .jpeg({ quality: 94 })
+      .toBuffer();
+  } catch (error) {
+    console.warn(`Comic bbox detection skipped for ${item.attachment}: ${error.message || error}`);
+    return buffer;
+  }
+}
+
+async function preparePreviewItemImage(buffer, item) {
+  const centeredBuffer = await centerComicInPhoto(buffer, item);
+
+  if (!config.legacyScanAutoPadding) {
+    return centeredBuffer;
+  }
+
+  try {
+    const border = await getWhiteBorderThickness(centeredBuffer);
+    const legacyScan = isLegacyScanBorder(border);
+
+    if (DRY_RUN) {
+      console.log(`${legacyScan ? 'Legacy scan detected:' : 'Normal photo.'} ${item.attachment}`);
+    }
+
+    if (!legacyScan) {
+      return centeredBuffer;
+    }
+
+    return addLegacyScanPadding(centeredBuffer);
+  } catch (error) {
+    console.warn(`Legacy scan detection skipped for ${item.attachment}: ${error.message || error}`);
+    return centeredBuffer;
+  }
+}
+
 async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
   ensureOutputDir();
   fs.accessSync(RUSSO_ONE_FONT_PATH, fs.constants.R_OK);
   console.log('Russo One font loaded successfully');
 
   const imageBuffers = await Promise.all(items.map((item) => downloadItemImage(item)));
+
   const firstBackground = await sharp(imageBuffers[0])
     .resize(PREVIEW_WIDTH, PREVIEW_HEIGHT, { fit: 'cover', position: sharp.strategy.attention })
     .blur(18)
@@ -1244,10 +1534,12 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
     .jpeg({ quality: 88 })
     .toBuffer();
   const composites = [{ input: firstBackground, left: 0, top: 0 }];
+  const gridSlots = [0, 1, 2, 3, 5, 6, 7, 8];
 
   for (const [index, buffer] of imageBuffers.entries()) {
-    const left = SAFE_PADDING + (index % 3) * (CARD_WIDTH + CELL_GAP);
-    const top = SAFE_PADDING + Math.floor(index / 3) * (CARD_HEIGHT + CELL_GAP);
+    const gridIndex = gridSlots[index] ?? index;
+    const left = SAFE_PADDING + (gridIndex % 3) * (CARD_WIDTH + CELL_GAP);
+    const top = SAFE_PADDING + Math.floor(gridIndex / 3) * (CARD_HEIGHT + CELL_GAP);
     const input = await sharp(buffer)
       .resize(CARD_WIDTH, CARD_HEIGHT, { fit: 'cover', position: sharp.strategy.attention })
       .jpeg({ quality: 90 })
@@ -1282,44 +1574,556 @@ async function uploadWallPhoto(filePath) {
     throw new Error('VK_USER_TOKEN пустой');
   }
 
-  const uploadServer = await vk('photos.getWallUploadServer', {
-    group_id: Math.abs(GROUP_ID),
-  }, POST_TOKEN);
+  let lastError = null;
 
-  const form = new FormData();
-  form.append('photo', fs.createReadStream(filePath));
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const uploadServer = await vk('photos.getWallUploadServer', {
+        group_id: Math.abs(GROUP_ID),
+      }, POST_TOKEN);
 
-  const uploadResponse = await axios.post(uploadServer.upload_url, form, {
-    headers: form.getHeaders(),
+      const form = new FormData();
+      form.append('photo', fs.createReadStream(filePath));
+
+      const uploadResponse = await axios.post(uploadServer.upload_url, form, {
+        headers: form.getHeaders(),
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      });
+
+      console.log('Upload response:');
+      console.log(JSON.stringify(uploadResponse.data, null, 2));
+
+      if (uploadResponse.data.error) {
+        throw new Error(`VK photo upload error: ${uploadResponse.data.error}`);
+      }
+
+      if (!uploadResponse.data.photo || !uploadResponse.data.server || !uploadResponse.data.hash) {
+        throw new Error('Preview upload failed: upload response is missing photo/server/hash');
+      }
+
+      console.log('Saving wall photo...');
+      const savedPhotos = await vk('photos.saveWallPhoto', {
+        group_id: Math.abs(GROUP_ID),
+        photo: uploadResponse.data.photo,
+        server: uploadResponse.data.server,
+        hash: uploadResponse.data.hash,
+      }, POST_TOKEN);
+
+      console.log('Save response:');
+      console.log(JSON.stringify(savedPhotos, null, 2));
+
+      const [photo] = Array.isArray(savedPhotos) ? savedPhotos : [];
+
+      if (!photo) {
+        throw new Error('Preview upload failed: photo is undefined');
+      }
+
+      const previewAttachment = `photo${photo.owner_id}_${photo.id}`;
+
+      console.log(`Preview attachment: ${previewAttachment}`);
+
+      if (!isValidPhotoAttachment(previewAttachment)) {
+        throw new Error('Preview upload failed: photo is undefined');
+      }
+
+      return previewAttachment;
+    } catch (error) {
+      lastError = error;
+      console.warn(`Preview upload attempt ${attempt} failed: ${error.message || error}`);
+
+      if (attempt < 3) {
+        await sleep(1500);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+async function getPostponedWallPosts() {
+  const response = await vkRead('wall.get', {
+    owner_id: -Math.abs(GROUP_ID),
+    filter: 'postponed',
+    count: 100,
   });
 
-  if (uploadResponse.data.error) {
-    throw new Error(`VK photo upload error: ${uploadResponse.data.error}`);
+  await sleep(1000);
+
+  return response.items || [];
+}
+
+function buildMissingQueueDates(existingQueuePosts, queueDays, publishTime) {
+  const existingDateKeys = new Set(
+    existingQueuePosts.map((post) => formatDateForFile(new Date(post.date * 1000))),
+  );
+  const dates = [];
+  let cursor = getFirstPublishDate(publishTime);
+
+  while (existingQueuePosts.length + dates.length < queueDays) {
+    const key = formatDateForFile(cursor);
+
+    if (!existingDateKeys.has(key)) {
+      dates.push(new Date(cursor));
+      existingDateKeys.add(key);
+    }
+
+    cursor = addDays(cursor, 1);
   }
 
-  const savedPhotos = await vk('photos.saveWallPhoto', {
-    group_id: Math.abs(GROUP_ID),
-    photo: uploadResponse.data.photo,
-    server: uploadResponse.data.server,
-    hash: uploadResponse.data.hash,
-  }, POST_TOKEN);
+  return dates;
+}
 
-  console.log('VK photos.saveWallPhoto response:');
-  console.log(JSON.stringify(savedPhotos, null, 2));
+function buildTestQueueDates(existingQueuePosts, postsCount, publishTime) {
+  const existingDateKeys = new Set(
+    existingQueuePosts.map((post) => formatDateForFile(new Date(post.date * 1000))),
+  );
+  const dates = [];
+  let cursor = getFirstPublishDate(publishTime);
 
-  const [photo] = savedPhotos;
+  while (dates.length < postsCount) {
+    const key = formatDateForFile(cursor);
 
-  if (!photo) {
-    throw new Error('Preview upload failed: photo is undefined');
+    if (!existingDateKeys.has(key)) {
+      dates.push(new Date(cursor));
+      existingDateKeys.add(key);
+    }
+
+    cursor = addDays(cursor, 1);
   }
 
-  const previewAttachment = `photo${photo.owner_id}_${photo.id}`;
+  return dates;
+}
 
-  if (!isValidPhotoAttachment(previewAttachment)) {
-    throw new Error('Preview upload failed: photo is undefined');
+async function getQueueCandidateItems(albumIds) {
+  const products = [];
+  let loadedPhotos = 0;
+
+  for (const albumId of albumIds) {
+    const photos = await getAlbumPhotos(albumId);
+    loadedPhotos += photos.length;
+    photos.forEach((photo) => {
+      const item = normalizePhoto(photo, albumId);
+
+      if (item) {
+        products.push(item);
+      }
+    });
   }
 
-  return previewAttachment;
+  console.log(`Loaded photos: ${loadedPhotos}`);
+  return products;
+}
+
+async function photoHasAnyComments(item) {
+  const response = await vkRead('photos.getComments', {
+    owner_id: item.ownerId,
+    photo_id: item.id,
+    count: 1,
+  });
+
+  return Number(response.count || 0) > 0;
+}
+
+function splitQueueCandidates(candidates, usedPhotoHistory, futureScheduledAttachments, reuseAfterDays) {
+  const unusedCandidates = [];
+  const reusableCandidates = [];
+  const cooldownSeconds = Math.max(0, Number(reuseAfterDays || 0)) * 24 * 60 * 60;
+  const cooldownCutoff = Math.floor(Date.now() / 1000) - cooldownSeconds;
+
+  for (const item of candidates) {
+    if (futureScheduledAttachments.has(item.attachment)) {
+      continue;
+    }
+
+    const usedState = usedPhotoHistory.get(item.attachment);
+
+    if (!usedState) {
+      unusedCandidates.push(item);
+      continue;
+    }
+
+    const usedAt = Number(usedState.usedAt || 0);
+
+    if (usedAt <= cooldownCutoff) {
+      reusableCandidates.push({
+        item,
+        usedAt,
+      });
+    }
+  }
+
+  reusableCandidates.sort((a, b) => a.usedAt - b.usedAt);
+
+  return {
+    unusedCandidates: shuffle(unusedCandidates),
+    reusableCandidates: reusableCandidates.map((candidate) => candidate.item),
+  };
+}
+
+async function selectFromCandidateWindows(candidates, itemsPerPost, candidatePoolSize) {
+  const selected = [];
+  let commentChecks = 0;
+
+  for (let start = 0; start < candidates.length && selected.length < itemsPerPost; start += candidatePoolSize) {
+    const window = candidates.slice(start, start + candidatePoolSize);
+    console.log(`Candidate window: ${start + 1}-${start + window.length}`);
+
+    for (const item of window) {
+      if (selected.length >= itemsPerPost) {
+        break;
+      }
+
+      try {
+        commentChecks += 1;
+
+        if (!(await photoHasAnyComments(item))) {
+          selected.push(item);
+        }
+      } catch (error) {
+        console.warn(`Skipping ${item.attachment}: ${error.message || error}`);
+      }
+    }
+
+    console.log(`Comment checks: ${commentChecks}`);
+    console.log(`Selected: ${selected.length}`);
+  }
+
+  return selected;
+}
+
+async function selectQueueItems(
+  candidates,
+  usedPhotoHistory,
+  futureScheduledAttachments,
+  itemsPerPost,
+  candidatePoolSize,
+  reuseAfterDays,
+) {
+  const { unusedCandidates, reusableCandidates } = splitQueueCandidates(
+    candidates,
+    usedPhotoHistory,
+    futureScheduledAttachments,
+    reuseAfterDays,
+  );
+
+  console.log(`Cheap filter: ${unusedCandidates.length}`);
+
+  const selected = await selectFromCandidateWindows(unusedCandidates, itemsPerPost, candidatePoolSize);
+
+  if (selected.length >= itemsPerPost) {
+    return selected;
+  }
+
+  if (reusableCandidates.length === 0) {
+    return selected;
+  }
+
+  console.log(`Cooldown reusable candidates: ${reusableCandidates.length}`);
+  const reusableSelected = await selectFromCandidateWindows(
+    reusableCandidates,
+    itemsPerPost - selected.length,
+    candidatePoolSize,
+  );
+
+  return [...selected, ...reusableSelected];
+}
+
+function getFutureScheduledProductAttachments(posts) {
+  const attachments = new Set();
+
+  posts.forEach((post) => {
+    getWallPostPhotoAttachments(post)
+      .slice(1)
+      .forEach((photo) => {
+        attachments.add(`photo${photo.owner_id}_${photo.id}`);
+      });
+  });
+
+  return attachments;
+}
+
+async function createScheduledPost(targetDate, context) {
+  const {
+    candidates,
+    usedPhotoHistory,
+    futureScheduledAttachments,
+    itemsPerPost,
+    candidatePoolSize,
+    reuseAfterDays,
+  } = context;
+
+  console.log('');
+  console.log('-------------------------');
+  console.log('Creating scheduled post:');
+  console.log(`Target date: ${formatPublishDate(toUnixTimestamp(targetDate))}`);
+
+  try {
+    const items = await selectQueueItems(
+      candidates,
+      usedPhotoHistory,
+      futureScheduledAttachments,
+      itemsPerPost,
+      candidatePoolSize,
+      reuseAfterDays,
+    );
+
+    if (items.length < itemsPerPost) {
+      throw new Error('Not enough available products');
+    }
+
+    const previewPath = path.join(OUTPUT_DIR, `queue-preview-${formatDateForFile(targetDate)}.jpg`);
+    console.log('Generating preview...');
+    const previewFile = await createPreviewImage(items, previewPath);
+    console.log(`Preview path: ${previewFile}`);
+
+    const postText = buildPostText(items);
+
+    if (DRY_RUN) {
+      const publishTimestamp = toUnixTimestamp(targetDate);
+      const attachments = buildWallAttachments(items);
+
+      if (!attachments) {
+        throw new Error('Attachments are undefined');
+      }
+
+      const attachmentsInfo = getAttachmentsInfo(attachments);
+      console.log(`Attachments count: ${attachmentsInfo.count}`);
+      console.log(`First attachment: ${attachmentsInfo.first}`);
+      console.log(`DRY_RUN=true: wall.post skipped`);
+      printDbSavePreview(null, publishTimestamp, formatPublishDate(publishTimestamp), buildDbItems(items));
+      console.log('-------------------------');
+      return {
+        ok: true,
+        dryRun: true,
+        saved: false,
+        items,
+        usedAt: publishTimestamp,
+        publishTimestamp,
+      };
+    }
+
+    console.log('Uploading preview...');
+    const previewAttachment = await uploadWallPhoto(previewFile);
+
+    if (!isValidPhotoAttachment(previewAttachment)) {
+      throw new Error('Preview upload failed: photo is undefined');
+    }
+
+    await sleep(1000);
+
+    const attachments = buildWallAttachments(items, previewAttachment);
+
+    if (!attachments) {
+      throw new Error('Attachments are undefined');
+    }
+
+    const attachmentsInfo = getAttachmentsInfo(attachments);
+
+    if (attachmentsInfo.count !== items.length + 1 || !attachmentsInfo.first) {
+      throw new Error('Attachments validation failed');
+    }
+
+    console.log(`Attachments count: ${attachmentsInfo.count}`);
+    console.log(`First attachment: ${attachmentsInfo.first}`);
+    console.log('Wall post...');
+
+    const publishResult = await publishDelayedPostSkippingTakenDates(postText, attachments, targetDate);
+    const vkPostId = publishResult.result.post_id;
+
+    if (!vkPostId) {
+      throw new Error('wall.post did not return post_id');
+    }
+
+    console.log(`Post id: ${vkPostId}`);
+    console.log('Created scheduled post:');
+    console.log(`vk_post_id: ${vkPostId}`);
+    console.log(`publish_date: ${formatPublishDate(publishResult.publishTimestamp)}`);
+
+    const dbResult = saveScheduledPost({
+      vkPostId,
+      publishDate: publishResult.publishTimestamp,
+      publishDateText: formatPublishDate(publishResult.publishTimestamp),
+      items: buildDbItems(items),
+    });
+
+    if (!dbResult.saved) {
+      console.log(`Queued post DB save skipped: ${vkPostId}`);
+    } else {
+      console.log('DB saved.');
+    }
+
+    await waitToAvoidVkRateLimit(2000);
+    console.log('-------------------------');
+
+    return {
+      ok: true,
+      vkPostId,
+      saved: dbResult.saved,
+      items,
+      usedAt: publishResult.publishTimestamp,
+      publishTimestamp: publishResult.publishTimestamp,
+    };
+  } catch (error) {
+    console.error(`Scheduled post failed: ${error.message || error}`);
+    console.log('-------------------------');
+    return {
+      ok: false,
+      error,
+    };
+  }
+}
+
+async function ensureQueue() {
+  const queueDays = Number(config.queueDays || 3);
+  const testQueuePosts = Number(config.testQueuePosts || 0);
+  const publishTime = config.publishTime || '20:30';
+  const itemsPerPost = Number(config.itemsPerPost || 8);
+  const candidatePoolSize = Number(config.candidatePoolSize || 30);
+  const reuseAfterDays = Number(config.reuseAfterDays || 120);
+  const albumIds = Array.isArray(config.albums) ? config.albums : [];
+
+  if (albumIds.length === 0) {
+    throw new Error('В config.json не указаны albums');
+  }
+
+  const postponedPosts = await getPostponedWallPosts();
+  const nowTimestamp = Math.floor(Date.now() / 1000);
+  const rouletteQueuePosts = postponedPosts
+    .filter((post) => post.date > nowTimestamp)
+    .filter(isRoulettePost)
+    .sort((a, b) => a.date - b.date);
+
+  console.log(`Future roulette posts: ${rouletteQueuePosts.length}`);
+  console.log(`queueDays: ${queueDays}`);
+  console.log(`testQueuePosts: ${testQueuePosts}`);
+
+  const missingDates = testQueuePosts > 0
+    ? buildTestQueueDates(rouletteQueuePosts, testQueuePosts, publishTime)
+    : buildMissingQueueDates(rouletteQueuePosts, queueDays, publishTime);
+
+  console.log('');
+  console.log('Current future posts:');
+  if (rouletteQueuePosts.length === 0) {
+    console.log('(none)');
+  } else {
+    rouletteQueuePosts.forEach((post) => {
+      console.log(`${post.id} | ${formatPublishDate(post.date)}`);
+    });
+  }
+  console.log(`queueDays: ${queueDays}`);
+  console.log(`Need to create: ${missingDates.length}`);
+  console.log('Target dates:');
+  if (missingDates.length === 0) {
+    console.log('(none)');
+  } else {
+    missingDates.forEach((date) => {
+      console.log(formatPublishDate(toUnixTimestamp(date)));
+    });
+  }
+
+  if (testQueuePosts <= 0 && rouletteQueuePosts.length >= queueDays) {
+    console.log('Queue is healthy. Nothing to create.');
+    console.log('');
+    console.log('Queue summary:');
+    console.log('Created: 0');
+    console.log('Skipped: 0');
+    console.log('Failed: 0');
+    return;
+  }
+
+  const candidates = await getQueueCandidateItems(albumIds);
+  const futureScheduledAttachments = getFutureScheduledProductAttachments(rouletteQueuePosts);
+  const usedPhotoHistory = new Map(
+    getUsedPhotoHistory().map((row) => [
+      row.photo_attachment,
+      {
+        usedAt: Number(row.used_at || 0),
+        state: row.state || 'scheduled',
+      },
+    ]),
+  );
+
+  console.log(`Need to create: ${missingDates.length}`);
+  console.log(`Candidate products: ${candidates.length}`);
+  console.log(`Already used products: ${usedPhotoHistory.size}`);
+  console.log(`Future scheduled product attachments: ${futureScheduledAttachments.size}`);
+  console.log(`candidatePoolSize: ${candidatePoolSize}`);
+  console.log(`reuseAfterDays: ${reuseAfterDays}`);
+
+  const summary = {
+    created: 0,
+    skipped: 0,
+    failed: 0,
+  };
+
+  for (const publishDate of missingDates) {
+    const createdPost = await createScheduledPost(publishDate, {
+      candidates,
+      usedPhotoHistory,
+      futureScheduledAttachments,
+      itemsPerPost,
+      candidatePoolSize,
+      reuseAfterDays,
+    });
+
+    if (!createdPost.ok) {
+      summary.failed += 1;
+      continue;
+    }
+
+    if (createdPost.saved) {
+      summary.created += 1;
+      createdPost.items.forEach((item) => {
+        usedPhotoHistory.set(item.attachment, {
+          usedAt: createdPost.usedAt,
+          state: 'scheduled',
+        });
+        futureScheduledAttachments.add(item.attachment);
+      });
+    } else {
+      summary.skipped += 1;
+    }
+  }
+
+  console.log('');
+  console.log('Queue summary:');
+  console.log(`Created: ${summary.created}`);
+  console.log(`Skipped: ${summary.skipped}`);
+  console.log(`Failed: ${summary.failed}`);
+}
+
+async function printQueueState() {
+  const albumIds = Array.isArray(config.albums) ? config.albums : [];
+  const reuseAfterDays = Number(config.reuseAfterDays || 120);
+  const cooldownSeconds = Math.max(0, reuseAfterDays) * 24 * 60 * 60;
+  const cooldownCutoff = Math.floor(Date.now() / 1000) - cooldownSeconds;
+
+  if (albumIds.length === 0) {
+    throw new Error('В config.json не указаны albums');
+  }
+
+  const summary = getUsedItemsSummary();
+  const usedPhotoHistory = new Map(
+    getUsedPhotoHistory().map((row) => [
+      row.photo_attachment,
+      {
+        usedAt: Number(row.used_at || 0),
+        state: row.state || 'scheduled',
+      },
+    ]),
+  );
+  const candidates = await getQueueCandidateItems(albumIds);
+  const availableCount = candidates.filter((item) => {
+    const usedState = usedPhotoHistory.get(item.attachment);
+    return !usedState || usedState.usedAt <= cooldownCutoff;
+  }).length;
+
+  console.log(`Scheduled items: ${summary.scheduled || 0}`);
+  console.log(`Published items: ${summary.published || 0}`);
+  console.log(`Deleted items: ${summary.deleted || 0}`);
+  console.log(`Reuse after days: ${reuseAfterDays}`);
+  console.log(`Available items: ${availableCount}`);
 }
 
 async function main() {
@@ -1338,6 +2142,33 @@ async function main() {
     }
 
     printScheduledPost(vkPostId);
+    return;
+  }
+
+  if (command === 'mark-deleted') {
+    const vkPostId = Number(commandArg);
+
+    if (!vkPostId) {
+      throw new Error('Usage: node index.js mark-deleted POST_ID');
+    }
+
+    const result = markScheduledPostDeleted(vkPostId);
+
+    if (!result.updated) {
+      throw new Error(`Post ${vkPostId} not found.`);
+    }
+
+    console.log(`Post ${vkPostId} marked as deleted.`);
+    return;
+  }
+
+  if (command === 'reset-test-posts') {
+    const result = resetTestPosts();
+
+    console.log(`Deleted test posts from DB: ${result.deletedPosts.length}`);
+    result.deletedPosts.forEach((vkPostId) => {
+      console.log(vkPostId);
+    });
     return;
   }
 
@@ -1376,6 +2207,16 @@ async function main() {
     return;
   }
 
+  if (command === 'ensure-queue') {
+    await ensureQueue();
+    return;
+  }
+
+  if (command === 'queue') {
+    await printQueueState();
+    return;
+  }
+
   console.log('TOKEN USAGE:');
   console.log(`photos.get: ${getReadTokenName()}`);
   console.log(`upload preview image: ${getPostTokenName()}`);
@@ -1383,7 +2224,7 @@ async function main() {
   console.log('');
 
   const albumIds = Array.isArray(config.albums) ? config.albums : [];
-  const itemsPerPost = Number(config.itemsPerPost || 9);
+  const itemsPerPost = Number(config.itemsPerPost || 8);
   const scheduledPostsCount = Number(config.scheduledPostsCount || 1);
   const publishTime = config.publishTime || '20:30';
 
@@ -1516,4 +2357,7 @@ module.exports = {
   syncRecentRoulettePosts,
   fixRecentReservations,
   reimportPostItems,
+  createScheduledPost,
+  ensureQueue,
+  printQueueState,
 };
