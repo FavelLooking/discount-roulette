@@ -164,6 +164,31 @@ function formatPublishDate(timestamp) {
   });
 }
 
+function getTimezoneDebugInfo() {
+  const now = new Date();
+  const offsetMinutes = now.getTimezoneOffset();
+  const offsetSign = offsetMinutes <= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffset / 60)).padStart(2, '0');
+  const offsetRemainder = String(absoluteOffset % 60).padStart(2, '0');
+
+  return {
+    localTime: now.toString(),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown',
+    utcOffset: `UTC${offsetSign}${offsetHours}:${offsetRemainder}`,
+  };
+}
+
+function logPublishDateDebug(publishTimestamp) {
+  const timezone = getTimezoneDebugInfo();
+
+  console.log('Publish date debug:');
+  console.log(`local time: ${timezone.localTime}`);
+  console.log(`timezone: ${timezone.timezone} (${timezone.utcOffset})`);
+  console.log(`publish_date timestamp: ${publishTimestamp}`);
+  console.log(`publish_date_text: ${formatPublishDate(publishTimestamp)}`);
+}
+
 function parsePublishTime(value = '20:30') {
   const match = String(value).match(/^(\d{1,2}):(\d{2})$/);
 
@@ -1083,6 +1108,8 @@ async function publishDelayedPost(postText, attachments, publishDate) {
     throw new Error('VK_USER_TOKEN пустой');
   }
 
+  logPublishDateDebug(publishDate);
+
   return vk('wall.post', {
     owner_id: -Math.abs(GROUP_ID),
     from_group: 1,
@@ -1890,6 +1917,7 @@ async function createScheduledPost(targetDate, context) {
       const attachmentsInfo = getAttachmentsInfo(attachments);
       console.log(`Attachments count: ${attachmentsInfo.count}`);
       console.log(`First attachment: ${attachmentsInfo.first}`);
+      logPublishDateDebug(publishTimestamp);
       console.log(`DRY_RUN=true: wall.post skipped`);
       printDbSavePreview(null, publishTimestamp, formatPublishDate(publishTimestamp), buildDbItems(items));
       console.log('-------------------------');
