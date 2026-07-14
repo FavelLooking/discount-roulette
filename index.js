@@ -58,6 +58,11 @@ const COMIC_BBOX_SAMPLE_SIZE = 360;
 const COMIC_BBOX_BACKGROUND_DISTANCE = 38;
 const COMIC_BBOX_MIN_AREA_RATIO = 0.18;
 const COMIC_BBOX_CROP_PADDING_RATIO = 0.025;
+const LONG_OPERATION_WARNING_MS = 30 * 1000;
+const OPERATION_TIMEOUT_MS = 45 * 1000;
+const VK_REQUEST_TIMEOUT_MS = 30 * 1000;
+const IMAGE_REQUEST_TIMEOUT_MS = 30 * 1000;
+const UPLOAD_REQUEST_TIMEOUT_MS = 45 * 1000;
 
 function getReadTokenName() {
   return 'VK_USER_TOKEN';
@@ -98,6 +103,38 @@ function shuffle(items) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withOperationTimeout(label, operation, timeoutMs = OPERATION_TIMEOUT_MS) {
+  let settled = false;
+  const startedAt = Date.now();
+  const warningTimer = setTimeout(() => {
+    if (!settled) {
+      console.warn(`${label} is taking longer than ${LONG_OPERATION_WARNING_MS / 1000} seconds...`);
+    }
+  }, LONG_OPERATION_WARNING_MS);
+  let timeoutTimer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutTimer = setTimeout(() => {
+      if (!settled) {
+        reject(new Error(`${label} timed out after ${timeoutMs} ms`));
+      }
+    }, timeoutMs);
+  });
+
+  return Promise.race([
+    Promise.resolve().then(operation),
+    timeoutPromise,
+  ]).finally(() => {
+    settled = true;
+    clearTimeout(warningTimer);
+    clearTimeout(timeoutTimer);
+    const durationMs = Date.now() - startedAt;
+
+    if (durationMs > LONG_OPERATION_WARNING_MS) {
+      console.warn(`${label} finished after ${durationMs} ms`);
+    }
+  });
 }
 
 async function waitToAvoidVkRateLimit(ms = 2000) {
@@ -164,6 +201,14 @@ function formatPublishDate(timestamp) {
   });
 }
 
+function formatMoscowDateTime(timestamp) {
+  return new Date(timestamp * 1000).toLocaleString('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    dateStyle: 'short',
+    timeStyle: 'short',
+  });
+}
+
 function getTimezoneDebugInfo() {
   const now = new Date();
   const offsetMinutes = now.getTimezoneOffset();
@@ -181,10 +226,16 @@ function getTimezoneDebugInfo() {
 
 function logPublishDateDebug(publishTimestamp) {
   const timezone = getTimezoneDebugInfo();
+  const currentTimestamp = Math.floor(Date.now() / 1000);
 
   console.log('Publish date debug:');
   console.log(`local time: ${timezone.localTime}`);
   console.log(`timezone: ${timezone.timezone} (${timezone.utcOffset})`);
+  console.log(`Current time: ${new Date(currentTimestamp * 1000).toString()} (${currentTimestamp})`);
+  console.log(`Current Moscow time: ${formatMoscowDateTime(currentTimestamp)} (${currentTimestamp})`);
+  console.log(`Target publish: ${new Date(publishTimestamp * 1000).toString()} (${publishTimestamp})`);
+  console.log(`Target publish Moscow: ${formatMoscowDateTime(publishTimestamp)} (${publishTimestamp})`);
+  console.log(`Is target in past: ${publishTimestamp <= currentTimestamp}`);
   console.log(`publish_date timestamp: ${publishTimestamp}`);
   console.log(`publish_date_text: ${formatPublishDate(publishTimestamp)}`);
 }
@@ -206,23 +257,57 @@ function parsePublishTime(value = '20:30') {
   return { hours, minutes };
 }
 
+function getMoscowDateParts(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Moscow',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date)
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, Number(part.value)]),
+  );
+
+  return {
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+    hours: parts.hour,
+    minutes: parts.minute,
+    seconds: parts.second,
+  };
+}
+
+function getMoscowTimestamp({ year, month, day, hours, minutes }) {
+  return Math.floor(Date.UTC(year, month - 1, day, hours - 3, minutes, 0, 0) / 1000);
+}
+
 function getFirstPublishDate(publishTime) {
   const { hours, minutes } = parsePublishTime(publishTime);
-  const publishDate = new Date();
+  const moscowNow = getMoscowDateParts();
+  let publishTimestamp = getMoscowTimestamp({
+    year: moscowNow.year,
+    month: moscowNow.month,
+    day: moscowNow.day,
+    hours,
+    minutes,
+  });
 
-  publishDate.setHours(hours, minutes, 0, 0);
-
-  if (publishDate.getTime() <= Date.now()) {
-    publishDate.setDate(publishDate.getDate() + 1);
+  if (publishTimestamp <= Math.floor(Date.now() / 1000)) {
+    publishTimestamp += 24 * 60 * 60;
   }
 
-  return publishDate;
+  return new Date(publishTimestamp * 1000);
 }
 
 function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
 function toUnixTimestamp(date) {
@@ -230,11 +315,11 @@ function toUnixTimestamp(date) {
 }
 
 function formatDateForFile(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+  const { year, month, day } = getMoscowDateParts(date);
+  const monthText = String(month).padStart(2, '0');
+  const dayText = String(day).padStart(2, '0');
 
-  return `${year}-${month}-${day}`;
+  return `${year}-${monthText}-${dayText}`;
 }
 
 function formatItemList(items) {
@@ -1067,13 +1152,27 @@ async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
   const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const response = await axios.get(`${VK_API_URL}/${method}`, {
-      params: {
-        ...params,
-        access_token: accessToken,
-        v: VK_API_VERSION,
-      },
-    });
+    let response = null;
+
+    try {
+      response = await axios.get(`${VK_API_URL}/${method}`, {
+        timeout: VK_REQUEST_TIMEOUT_MS,
+        params: {
+          ...params,
+          access_token: accessToken,
+          v: VK_API_VERSION,
+        },
+      });
+    } catch (error) {
+      if (attempt < maxAttempts) {
+        const delayMs = 3000 + Math.floor(Math.random() * 2001);
+        console.warn(`VK request failed on ${method}: ${error.code || error.message || error}. Retry ${attempt + 1}/${maxAttempts} after ${delayMs} ms`);
+        await sleep(delayMs);
+        continue;
+      }
+
+      throw error;
+    }
 
     if (response.data.error) {
       const { error_code: code, error_msg: message } = response.data.error;
@@ -1110,13 +1209,25 @@ async function publishDelayedPost(postText, attachments, publishDate) {
 
   logPublishDateDebug(publishDate);
 
-  return vk('wall.post', {
+  const wallPostParams = {
     owner_id: -Math.abs(GROUP_ID),
     from_group: 1,
     message: postText,
     attachments,
     publish_date: publishDate,
-  }, POST_TOKEN);
+  };
+
+  console.log('wall.post params:');
+  console.log(`owner_id: ${wallPostParams.owner_id}`);
+  console.log(`publish_date: ${wallPostParams.publish_date}`);
+  console.log(`attachments: ${wallPostParams.attachments}`);
+  console.log(`message: ${wallPostParams.message}`);
+  console.log(`new Date(publish_date * 1000).toString(): ${new Date(wallPostParams.publish_date * 1000).toString()}`);
+  console.log(`new Date(publish_date * 1000).toISOString(): ${new Date(wallPostParams.publish_date * 1000).toISOString()}`);
+  console.log(`new Date(publish_date * 1000).toLocaleString(): ${new Date(wallPostParams.publish_date * 1000).toLocaleString()}`);
+  console.log(`Intl.DateTimeFormat().resolvedOptions().timeZone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
+
+  return vk('wall.post', wallPostParams, POST_TOKEN);
 }
 
 async function getAlbumPhotos(albumId) {
@@ -1252,6 +1363,7 @@ async function publishDelayedPostSkippingTakenDates(postText, attachments, publi
 async function downloadImage(url) {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
+    timeout: IMAGE_REQUEST_TIMEOUT_MS,
   });
 
   return Buffer.from(response.data);
@@ -1552,8 +1664,20 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
   fs.accessSync(RUSSO_ONE_FONT_PATH, fs.constants.R_OK);
   console.log('Russo One font loaded successfully');
 
-  const imageBuffers = await Promise.all(items.map((item) => downloadItemImage(item)));
+  const imageBuffers = [];
 
+  for (const [index, item] of items.entries()) {
+    console.log(`Downloading preview image ${index + 1}/${items.length}: ${item.attachment}`);
+    imageBuffers.push(await withOperationTimeout(
+      `Downloading preview image ${item.attachment}`,
+      () => downloadItemImage(item),
+      IMAGE_REQUEST_TIMEOUT_MS * 2,
+    ));
+    console.log(`Preview image downloaded: ${item.attachment}`);
+  }
+
+  console.log('All preview images downloaded.');
+  console.log('Rendering preview background...');
   const firstBackground = await sharp(imageBuffers[0])
     .resize(PREVIEW_WIDTH, PREVIEW_HEIGHT, { fit: 'cover', position: sharp.strategy.attention })
     .blur(18)
@@ -1564,6 +1688,7 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
   const gridSlots = [0, 1, 2, 3, 5, 6, 7, 8];
 
   for (const [index, buffer] of imageBuffers.entries()) {
+    console.log(`Rendering preview cell ${index + 1}/${imageBuffers.length}`);
     const gridIndex = gridSlots[index] ?? index;
     const left = SAFE_PADDING + (gridIndex % 3) * (CARD_WIDTH + CELL_GAP);
     const top = SAFE_PADDING + Math.floor(gridIndex / 3) * (CARD_HEIGHT + CELL_GAP);
@@ -1575,12 +1700,14 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
     composites.push({ input, left, top });
   }
 
+  console.log('Rendering preview overlay...');
   composites.push({
     input: buildOverlaySvg(),
     left: 0,
     top: 0,
   });
 
+  console.log('Writing preview file...');
   await sharp({
     create: {
       width: PREVIEW_WIDTH,
@@ -1592,6 +1719,7 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
     .composite(composites)
     .jpeg({ quality: 92 })
     .toFile(outputPath);
+  console.log('Preview file written.');
 
   return outputPath;
 }
@@ -1616,6 +1744,7 @@ async function uploadWallPhoto(filePath) {
         headers: form.getHeaders(),
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
+        timeout: UPLOAD_REQUEST_TIMEOUT_MS,
       });
 
       console.log('Upload response:');
@@ -1639,6 +1768,7 @@ async function uploadWallPhoto(filePath) {
 
       console.log('Save response:');
       console.log(JSON.stringify(savedPhotos, null, 2));
+      console.log('Saved.');
 
       const [photo] = Array.isArray(savedPhotos) ? savedPhotos : [];
 
@@ -1836,7 +1966,9 @@ async function selectQueueItems(
 
   console.log(`Cheap filter: ${unusedCandidates.length}`);
 
+  console.log('Checking comments...');
   const selected = await selectFromCandidateWindows(unusedCandidates, itemsPerPost, candidatePoolSize);
+  console.log('Comments checked.');
 
   if (selected.length >= itemsPerPost) {
     return selected;
@@ -1847,11 +1979,13 @@ async function selectQueueItems(
   }
 
   console.log(`Cooldown reusable candidates: ${reusableCandidates.length}`);
+  console.log('Checking comments...');
   const reusableSelected = await selectFromCandidateWindows(
     reusableCandidates,
     itemsPerPost - selected.length,
     candidatePoolSize,
   );
+  console.log('Comments checked.');
 
   return [...selected, ...reusableSelected];
 }
@@ -1886,14 +2020,20 @@ async function createScheduledPost(targetDate, context) {
   console.log(`Target date: ${formatPublishDate(toUnixTimestamp(targetDate))}`);
 
   try {
-    const items = await selectQueueItems(
-      candidates,
-      usedPhotoHistory,
-      futureScheduledAttachments,
-      itemsPerPost,
-      candidatePoolSize,
-      reuseAfterDays,
+    console.log('Selecting candidates...');
+    const items = await withOperationTimeout(
+      'Selecting candidates',
+      () => selectQueueItems(
+        candidates,
+        usedPhotoHistory,
+        futureScheduledAttachments,
+        itemsPerPost,
+        candidatePoolSize,
+        reuseAfterDays,
+      ),
+      OPERATION_TIMEOUT_MS,
     );
+    console.log('Candidates selected.');
 
     if (items.length < itemsPerPost) {
       throw new Error('Not enough available products');
@@ -1901,7 +2041,12 @@ async function createScheduledPost(targetDate, context) {
 
     const previewPath = path.join(OUTPUT_DIR, `queue-preview-${formatDateForFile(targetDate)}.jpg`);
     console.log('Generating preview...');
-    const previewFile = await createPreviewImage(items, previewPath);
+    const previewFile = await withOperationTimeout(
+      'Generating preview',
+      () => createPreviewImage(items, previewPath),
+      OPERATION_TIMEOUT_MS,
+    );
+    console.log('Preview generated.');
     console.log(`Preview path: ${previewFile}`);
 
     const postText = buildPostText(items);
@@ -1932,7 +2077,12 @@ async function createScheduledPost(targetDate, context) {
     }
 
     console.log('Uploading preview...');
-    const previewAttachment = await uploadWallPhoto(previewFile);
+    const previewAttachment = await withOperationTimeout(
+      'Uploading preview',
+      () => uploadWallPhoto(previewFile),
+      OPERATION_TIMEOUT_MS * 3,
+    );
+    console.log('Preview uploaded.');
 
     if (!isValidPhotoAttachment(previewAttachment)) {
       throw new Error('Preview upload failed: photo is undefined');
@@ -1954,9 +2104,14 @@ async function createScheduledPost(targetDate, context) {
 
     console.log(`Attachments count: ${attachmentsInfo.count}`);
     console.log(`First attachment: ${attachmentsInfo.first}`);
-    console.log('Wall post...');
+    console.log('Creating wall.post...');
 
-    const publishResult = await publishDelayedPostSkippingTakenDates(postText, attachments, targetDate);
+    const publishResult = await withOperationTimeout(
+      'Creating wall.post',
+      () => publishDelayedPostSkippingTakenDates(postText, attachments, targetDate),
+      OPERATION_TIMEOUT_MS,
+    );
+    console.log('Done.');
     const vkPostId = publishResult.result.post_id;
 
     if (!vkPostId) {
@@ -2015,12 +2170,18 @@ async function ensureQueue() {
     throw new Error('В config.json не указаны albums');
   }
 
-  const postponedPosts = await getPostponedWallPosts();
+  console.log('Loading postponed posts...');
+  const postponedPosts = await withOperationTimeout(
+    'Loading postponed posts',
+    () => getPostponedWallPosts(),
+    OPERATION_TIMEOUT_MS,
+  );
   const nowTimestamp = Math.floor(Date.now() / 1000);
   const rouletteQueuePosts = postponedPosts
     .filter((post) => post.date > nowTimestamp)
     .filter(isRoulettePost)
     .sort((a, b) => a.date - b.date);
+  console.log('Postponed posts loaded.');
 
   console.log(`Future roulette posts: ${rouletteQueuePosts.length}`);
   console.log(`queueDays: ${queueDays}`);
@@ -2029,8 +2190,11 @@ async function ensureQueue() {
   const missingDates = testQueuePosts > 0
     ? buildTestQueueDates(rouletteQueuePosts, testQueuePosts, publishTime)
     : buildMissingQueueDates(rouletteQueuePosts, queueDays, publishTime);
+  const currentTimestamp = Math.floor(Date.now() / 1000);
 
   console.log('');
+  console.log(`Current Moscow time: ${formatMoscowDateTime(currentTimestamp)}`);
+  console.log(`First queue date: ${missingDates[0] ? formatMoscowDateTime(toUnixTimestamp(missingDates[0])) : '(none)'}`);
   console.log('Current future posts:');
   if (rouletteQueuePosts.length === 0) {
     console.log('(none)');
@@ -2046,7 +2210,10 @@ async function ensureQueue() {
     console.log('(none)');
   } else {
     missingDates.forEach((date) => {
-      console.log(formatPublishDate(toUnixTimestamp(date)));
+      const targetTimestamp = toUnixTimestamp(date);
+      console.log(formatMoscowDateTime(targetTimestamp));
+      console.log(`Target publish: ${formatMoscowDateTime(targetTimestamp)} (${targetTimestamp})`);
+      console.log(`Is target in past: ${targetTimestamp <= currentTimestamp}`);
     });
   }
 
@@ -2060,7 +2227,13 @@ async function ensureQueue() {
     return;
   }
 
-  const candidates = await getQueueCandidateItems(albumIds);
+  console.log('Loading photos...');
+  const candidates = await withOperationTimeout(
+    'Loading photos',
+    () => getQueueCandidateItems(albumIds),
+    OPERATION_TIMEOUT_MS * Math.max(1, albumIds.length),
+  );
+  console.log('Photos loaded.');
   const futureScheduledAttachments = getFutureScheduledProductAttachments(rouletteQueuePosts);
   const usedPhotoHistory = new Map(
     getUsedPhotoHistory().map((row) => [
@@ -2086,7 +2259,14 @@ async function ensureQueue() {
   };
 
   for (const publishDate of missingDates) {
-    const createdPost = await createScheduledPost(publishDate, {
+    let targetDate = new Date(publishDate);
+
+    while (toUnixTimestamp(targetDate) <= Math.floor(Date.now() / 1000)) {
+      console.log('Target time already passed, moving to next day');
+      targetDate = addDays(targetDate, 1);
+    }
+
+    const createdPost = await createScheduledPost(targetDate, {
       candidates,
       usedPhotoHistory,
       futureScheduledAttachments,
