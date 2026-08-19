@@ -1131,15 +1131,22 @@ function buildOverlaySvg() {
         <rect x="382" y="510" width="316" height="456" rx="28" fill="#fff7ed" fill-opacity="0.08"/>
         <rect x="400" y="528" width="280" height="420" rx="24" fill="#111827" fill-opacity="0.16"/>
       </g>
-      <text x="540" y="594" text-anchor="middle" font-family="Russo One, Arial, sans-serif" font-size="54" fill="#fff7ed" stroke="#451a03" stroke-width="1.2" paint-order="stroke">${escapeSvgText('🎲')}</text>
+      <g transform="translate(540 579) rotate(-8)" filter="url(#softGlow)">
+        <rect x="-27" y="-27" width="54" height="54" rx="12" fill="#fff7ed" stroke="#451a03" stroke-width="3"/>
+        <circle cx="-12" cy="-12" r="4.6" fill="#451a03"/>
+        <circle cx="0" cy="0" r="4.6" fill="#451a03"/>
+        <circle cx="12" cy="12" r="4.6" fill="#451a03"/>
+        <circle cx="12" cy="-12" r="4.6" fill="#451a03"/>
+        <circle cx="-12" cy="12" r="4.6" fill="#451a03"/>
+      </g>
       <path d="${titleTopPath}" fill="#fff7ed" stroke="#451a03" stroke-width="1.5"/>
       <path d="${titleBottomPath}" fill="#fff7ed" stroke="#451a03" stroke-width="1.5"/>
       <path d="${percentPath}" fill="#1c1917" fill-opacity="0.34" transform="translate(0 5)"/>
       <path d="${percentPath}" fill="#fff7ed" stroke="#1c1917" stroke-width="4" filter="url(#softGlow)"/>
       <rect x="418" y="873" width="244" height="42" rx="20" fill="#1c1917" fill-opacity="0.52"/>
       <text x="540" y="901" text-anchor="middle" font-family="Russo One, Arial, sans-serif" font-size="17" fill="#fed7aa" fill-opacity="0.94">${escapeSvgText('каждый день • 20:30')}</text>
-      <rect x="772" y="1370" width="212" height="50" rx="20" fill="#111827" fill-opacity="0.66"/>
-      <text x="878" y="1403" text-anchor="middle" font-family="Russo One, Arial, sans-serif" font-size="22" fill="#ffffff">${escapeSvgText('⏳ актуально 24 часа')}</text>
+      <rect x="664" y="1370" width="320" height="50" rx="20" fill="#111827" fill-opacity="0.66"/>
+      <text x="824" y="1403" text-anchor="middle" font-family="Russo One, Arial, sans-serif" font-size="22" fill="#ffffff">${escapeSvgText('⏳ актуально 24 часа')}</text>
     </svg>
   `);
 }
