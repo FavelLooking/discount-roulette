@@ -10,6 +10,7 @@
     276003115
   ],
   "discountPercent": 25,
+  "goldDiscountPercent": 35,
   "itemsPerPost": 8,
   "scheduledPostsCount": 10,
   "queueDays": 5,
@@ -20,6 +21,8 @@
   "reuseAfterDays": 120,
   "legacyScanAutoPadding": true,
   "publishTime": "20:30",
+  "rouletteCardAttachment": "",
+  "rouletteGoldCardAttachment": "",
   "centerImageAttachment": "",
   "excludeWords": ["продано", "бронь", "sold", "нет в наличии"]
 }

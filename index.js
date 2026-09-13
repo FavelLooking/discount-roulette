@@ -1,6 +1,5 @@
 const axios = require('axios');
 const dotenv = require('dotenv');
-const FormData = require('form-data');
 const fs = require('fs');
 const opentype = require('opentype.js');
 const path = require('path');
@@ -10,11 +9,20 @@ const {
   DB_PATH,
   saveScheduledPost,
   importPublishedPost,
+  getQueueStateExport,
+  importQueueState,
   listScheduledPosts,
   getScheduledPost,
   getLatestScheduledPost,
   listPostsForReservationFix,
+  listFutureScheduledPosts,
   listPostsForReservationFixByIds,
+  markReservationsChecked,
+  markScheduledPostPublished,
+  getNextRouletteSequenceNumber,
+  getScheduledPostByProductFingerprint,
+  getOrCreateGoldBlock,
+  getGoldBlock,
   getPostItems,
   replacePostItems,
   getUsedPhotoHistory,
@@ -27,18 +35,36 @@ const {
   updateReservationResolved,
   updateReservationUnresolvedComment,
   listReservations,
+  recordVkApiUsage,
+  getApiUsageRows,
+  getApiUsageTotal,
 } = require('./db');
+const {
+  GOLD_BLOCK_SIZE,
+  createGoldPosition,
+  getGoldBlockNumber,
+  resolveRouletteVariant,
+} = require('./rouletteVariant');
 
 dotenv.config({ quiet: true });
 
 const VK_API_URL = 'https://api.vk.com/method';
 const VK_API_VERSION = process.env.VK_API_VERSION || '5.199';
 const GROUP_ID = Number(process.env.VK_GROUP_ID);
-const ACCESS_TOKEN = process.env.VK_USER_TOKEN;
-const POST_TOKEN = process.env.VK_USER_TOKEN;
+const SERVICE_TOKEN = process.env.VK_SERVICE_TOKEN;
+const GROUP_TOKEN = process.env.VK_GROUP_TOKEN;
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 const SKIP_UNRESOLVED_REPLIES = process.env.SKIP_UNRESOLVED_REPLIES === 'true';
 const PUBLISH_DELAY_MINUTES = Number(process.env.PUBLISH_DELAY_MINUTES || 130);
+const ROULETTE_CARD_ATTACHMENT = process.env.VK_ROULETTE_CARD_ATTACHMENT || config.rouletteCardAttachment || '';
+const ROULETTE_GOLD_CARD_ATTACHMENT = process.env.VK_ROULETTE_GOLD_CARD_ATTACHMENT || config.rouletteGoldCardAttachment || '';
+const NORMAL_DISCOUNT_PERCENT = Number(config.discountPercent || 25);
+const GOLD_DISCOUNT_PERCENT = Number(config.goldDiscountPercent || 35);
+const VK_API_MONTHLY_BUDGET = Number(process.env.VK_API_MONTHLY_BUDGET || 0);
+// Isolated VK rendering hint. Remove this constant/param if VK rejects it.
+const PRIMARY_ATTACHMENTS_MODE = 'grid';
+const RUNTIME_DIR = path.join(__dirname, 'runtime');
+const QUEUE_STATE_EXPORT_PATH = path.join(RUNTIME_DIR, 'queue-state-export.json');
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const PREVIEW_PATH = path.join(OUTPUT_DIR, 'preview.jpg');
 const RUSSO_ONE_FONT_PATH = path.join(__dirname, 'assets', 'fonts', 'RussoOne-Regular.woff');
@@ -62,14 +88,13 @@ const LONG_OPERATION_WARNING_MS = 30 * 1000;
 const OPERATION_TIMEOUT_MS = 45 * 1000;
 const VK_REQUEST_TIMEOUT_MS = 30 * 1000;
 const IMAGE_REQUEST_TIMEOUT_MS = 30 * 1000;
-const UPLOAD_REQUEST_TIMEOUT_MS = 45 * 1000;
 
 function getReadTokenName() {
-  return 'VK_USER_TOKEN';
+  return 'VK_SERVICE_TOKEN';
 }
 
 function getPostTokenName() {
-  return 'VK_USER_TOKEN';
+  return 'VK_GROUP_TOKEN';
 }
 
 function parsePrice(text = '') {
@@ -146,10 +171,15 @@ function formatMoney(value) {
   return new Intl.NumberFormat('ru-RU').format(value);
 }
 
-function buildPostText(items) {
-  const discountPercent = Number(config.discountPercent || 0);
+function calculateDiscountPrice(price, discountPercent) {
+  return Math.round(Number(price) * (100 - Number(discountPercent)) / 100);
+}
+
+function buildPostText(items, options = {}) {
+  const discountPercent = Number(options.discountPercent ?? NORMAL_DISCOUNT_PERCENT);
+  const variant = options.variant || 'normal';
   const priceLines = items.map((item, index) => {
-    const discountedPrice = Math.round(item.price * (100 - discountPercent) / 100);
+    const discountedPrice = calculateDiscountPrice(item.price, discountPercent);
     const priceLine = discountPercent > 0
       ? `${formatMoney(item.price)} ₽ → ${formatMoney(discountedPrice)} ₽`
       : `${formatMoney(item.price)} ₽`;
@@ -157,7 +187,30 @@ function buildPostText(items) {
     return `${index + 1}. ${priceLine}`;
   });
 
-  const lines = [
+  const lines = variant === 'gold' ? [
+    '✨ ЗОЛОТОЙ СЕКТОР',
+    '',
+    `Сегодня выпал Золотой сектор — скидка ${discountPercent}% на все ${items.length} товаров.`,
+    '',
+    '⏳ Актуально 24 часа — до 20:30 следующего дня.',
+    'После этого пост исчезнет.',
+    '',
+    'Цены со скидкой:',
+    '',
+    ...priceLines,
+    '',
+    '🔔 Включайте уведомления сообщества или ставьте будильник, чтобы не пропускать новые подборки.',
+    '',
+    'Чтобы зафиксировать скидку, напишите в комментарии:',
+    'номер лота + “бронь”',
+    '',
+    'Например: 6 бронь',
+    '',
+    'Такие выпуски появляются редко. Подпишитесь на рассылку сообщества, чтобы не пропустить следующий.',
+    '',
+    '#CP_СкидочнаяРулетка',
+    '#CP_ЗолотойСектор',
+  ] : [
     '🎲 Скидочная рулетка',
     '',
     `Каждый день в 20:30 выпадают ${items.length} случайных товаров из альбомов.`,
@@ -183,15 +236,71 @@ function buildPostText(items) {
   return lines.join('\n');
 }
 
-function buildWallAttachments(items, previewAttachment = '') {
+function buildWallAttachments(items, centerAttachment = ROULETTE_CARD_ATTACHMENT) {
   const productAttachments = items.map((item) => item.attachment);
-  const attachments = previewAttachment
-    ? [previewAttachment, ...productAttachments]
+  const staticCardAttachment = String(centerAttachment || '').trim();
+  const attachments = staticCardAttachment
+    ? [
+      ...productAttachments.slice(0, 4),
+      staticCardAttachment,
+      ...productAttachments.slice(4),
+    ]
     : productAttachments;
 
   return attachments
     .filter((attachment) => typeof attachment === 'string' && attachment.trim())
     .join(',');
+}
+
+function buildProductFingerprint(items) {
+  return items
+    .map((item) => String(item.attachment || '').trim())
+    .filter(Boolean)
+    .sort()
+    .join('|');
+}
+
+function resolveCardAttachment(variant) {
+  return variant === 'gold' ? ROULETTE_GOLD_CARD_ATTACHMENT : ROULETTE_CARD_ATTACHMENT;
+}
+
+function createRouletteAssignment(sequenceNumber = getNextRouletteSequenceNumber(), options = {}) {
+  const persist = options.persist !== false;
+  const goldBlockCache = options.goldBlockCache || null;
+  const blockNumber = getGoldBlockNumber(sequenceNumber, GOLD_BLOCK_SIZE);
+  const existingBlock = getGoldBlock(blockNumber);
+  let dryRunGoldPosition = null;
+
+  if (!persist && goldBlockCache) {
+    if (!goldBlockCache.has(blockNumber)) {
+      goldBlockCache.set(blockNumber, existingBlock
+        ? Number(existingBlock.gold_position)
+        : createGoldPosition(Math.random, GOLD_BLOCK_SIZE));
+    }
+
+    dryRunGoldPosition = goldBlockCache.get(blockNumber);
+  }
+
+  const block = persist
+    ? getOrCreateGoldBlock(blockNumber, () => createGoldPosition(Math.random, GOLD_BLOCK_SIZE))
+    : {
+      blockNumber,
+      goldPosition: dryRunGoldPosition
+        ?? (existingBlock ? Number(existingBlock.gold_position) : createGoldPosition(Math.random, GOLD_BLOCK_SIZE)),
+      created: false,
+    };
+  const assignment = resolveRouletteVariant(sequenceNumber, block.goldPosition, {
+    blockSize: GOLD_BLOCK_SIZE,
+    normalDiscountPercent: NORMAL_DISCOUNT_PERCENT,
+    goldDiscountPercent: GOLD_DISCOUNT_PERCENT,
+    normalCardAttachment: ROULETTE_CARD_ATTACHMENT,
+    goldCardAttachment: ROULETTE_GOLD_CARD_ATTACHMENT,
+  });
+
+  return {
+    ...assignment,
+    blockCreated: block.created,
+  };
 }
 
 function formatPublishDate(timestamp) {
@@ -322,27 +431,23 @@ function formatDateForFile(date) {
   return `${year}-${monthText}-${dayText}`;
 }
 
-function formatItemList(items) {
-  const discountPercent = Number(config.discountPercent || 0);
-
+function formatItemList(items, discountPercent = NORMAL_DISCOUNT_PERCENT) {
   return items
     .map((item, index) => {
-      const discountedPrice = Math.round(item.price * (100 - discountPercent) / 100);
+      const discountedPrice = calculateDiscountPrice(item.price, discountPercent);
       return `${index + 1}. ${item.attachment} — ${formatMoney(item.price)} ₽ → ${formatMoney(discountedPrice)} ₽`;
     })
     .join('\n');
 }
 
-function buildDbItems(items) {
-  const discountPercent = Number(config.discountPercent || 0);
-
+function buildDbItems(items, discountPercent = NORMAL_DISCOUNT_PERCENT) {
   return items.map((item) => ({
     photoAttachment: item.attachment,
     photoOwnerId: item.ownerId,
     photoId: item.id,
     albumId: item.albumId,
     originalPrice: item.price,
-    discountPrice: Math.round(item.price * (100 - discountPercent) / 100),
+    discountPrice: calculateDiscountPrice(item.price, discountPercent),
     photoText: item.text || '',
   }));
 }
@@ -374,6 +479,9 @@ function printScheduledPostsList() {
       `vk_post_id=${post.vk_post_id}`,
       `publish_date_text=${post.publish_date_text}`,
       `status=${post.status}`,
+      `variant=${post.variant || ''}`,
+      `discount=${post.discount_percent || ''}`,
+      `sequence=${post.roulette_sequence_number || ''}`,
       `items=${post.items_count}`,
     ].join(' | '));
   });
@@ -398,6 +506,12 @@ function printScheduledPost(vkPostId) {
   console.log(`delete_after: ${post.delete_after}`);
   console.log(`status: ${post.status}`);
   console.log(`created_at: ${post.created_at}`);
+  console.log(`variant: ${post.variant || ''}`);
+  console.log(`discount_percent: ${post.discount_percent || ''}`);
+  console.log(`card_attachment: ${post.card_attachment || ''}`);
+  console.log(`roulette_sequence_number: ${post.roulette_sequence_number || ''}`);
+  console.log(`gold_block_number: ${post.gold_block_number || ''}`);
+  console.log(`gold_position: ${post.gold_position || ''}`);
   console.log('');
   console.log('ITEMS:');
   items.forEach((item) => {
@@ -454,7 +568,21 @@ function buildImportedPostItems(post) {
   const pricesByNumber = parsePostPriceLines(post.text || '');
   const photos = getWallPostPhotoAttachments(post);
   logPostPhotoAttachments(post, photos);
-  const productPhotos = photos.slice(1, 9);
+  const staticCardAttachments = new Set([
+    String(ROULETTE_CARD_ATTACHMENT || '').trim(),
+    String(ROULETTE_GOLD_CARD_ATTACHMENT || '').trim(),
+  ].filter(Boolean));
+  const productPhotos = photos
+    .filter((photo, index) => {
+      const attachment = `photo${photo.owner_id}_${photo.id}`;
+
+      if (staticCardAttachments.size > 0) {
+        return !staticCardAttachments.has(attachment);
+      }
+
+      return index > 0;
+    })
+    .slice(0, 8);
 
   if (pricesByNumber.size === 0) {
     console.warn(`Warning: prices were not parsed for post ${post.id}`);
@@ -480,12 +608,23 @@ function buildImportedPostItems(post) {
   });
 }
 
+function inferImportedPostVariant(post) {
+  const text = String(post.text || '');
+  const isGold = text.includes('#CP_ЗолотойСектор') || text.includes('ЗОЛОТОЙ СЕКТОР');
+
+  return {
+    variant: isGold ? 'gold' : 'normal',
+    discountPercent: isGold ? GOLD_DISCOUNT_PERCENT : NORMAL_DISCOUNT_PERCENT,
+    cardAttachment: isGold ? ROULETTE_GOLD_CARD_ATTACHMENT : ROULETTE_CARD_ATTACHMENT,
+  };
+}
+
 function isRoulettePost(post) {
   return String(post.text || '').includes('#CP_СкидочнаяРулетка');
 }
 
 async function getRecentWallPosts(limit = 3) {
-  const response = await vkRead('wall.get', {
+  const response = await vkQueue('wall.get', {
     owner_id: -Math.abs(GROUP_ID),
     count: limit,
   });
@@ -496,7 +635,7 @@ async function getRecentWallPosts(limit = 3) {
 }
 
 async function getWallPostById(postId) {
-  const response = await vkRead('wall.getById', {
+  const response = await vkQueue('wall.getById', {
     posts: `${-Math.abs(GROUP_ID)}_${postId}`,
   });
 
@@ -525,11 +664,18 @@ async function syncRecentRoulettePosts() {
 
   for (const post of roulettePosts) {
     let items = buildImportedPostItems(post);
+    const importedVariant = inferImportedPostVariant(post);
     const result = importPublishedPost({
       vkPostId: post.id,
       publishDate: post.date,
       publishDateText: formatPublishDate(post.date),
       items,
+      variant: importedVariant.variant,
+      discountPercent: importedVariant.discountPercent,
+      cardAttachment: importedVariant.cardAttachment,
+      productFingerprint: buildProductFingerprint(items.map((item) => ({
+        attachment: item.photoAttachment,
+      }))),
     });
 
     syncedPostIds.push(post.id);
@@ -539,10 +685,11 @@ async function syncRecentRoulettePosts() {
       markPostItemsState(post.id, 'published', post.date);
     } else if (result.reason === 'duplicate') {
       console.log(`Post ${post.id} already exists, skipped`);
+      markScheduledPostPublished(post.id, post.date);
       const existingItems = getPostItems(post.id);
 
       if (existingItems.length < 8) {
-        console.warn(`post_items less than 9 for post ${post.id}, reimporting`);
+        console.warn(`post_items less than 8 for post ${post.id}, reimporting`);
         items = buildImportedPostItems(post);
         replacePostItems(post.id, items);
         console.log(`Reimported post ${post.id}: ${items.length} items`);
@@ -577,23 +724,7 @@ async function reimportPostItems(postId) {
 }
 
 async function fixRecentReservations() {
-  const recentPostIds = await syncRecentRoulettePosts();
-
-  if (recentPostIds.length === 0) {
-    console.log('No recent roulette posts found');
-    return;
-  }
-
-  await sleep(1000);
-
-  const posts = listPostsForReservationFixByIds(recentPostIds);
-
-  if (posts.length === 0) {
-    console.log('No imported recent roulette posts found in DB');
-    return;
-  }
-
-  await fixReservations(posts);
+  await fixReservations();
 }
 
 function parseReservationItemNumber(text = '') {
@@ -669,7 +800,7 @@ async function getWallComments(postId) {
   await sleep(1000);
 
   while (true) {
-    const response = await vkRead('wall.getComments', {
+    const response = await vkReservation('wall.getComments', {
       owner_id: ownerId,
       post_id: postId,
       count,
@@ -701,63 +832,6 @@ async function getWallComments(postId) {
   return comments;
 }
 
-async function getPhotoComments(item) {
-  const count = 100;
-  let offset = 0;
-  const comments = [];
-
-  while (true) {
-    const response = await vkRead('photos.getComments', {
-      owner_id: item.photo_owner_id,
-      photo_id: item.photo_id,
-      count,
-      offset,
-      sort: 'asc',
-    });
-
-    comments.push(...response.items);
-
-    if (comments.length >= response.count || response.items.length === 0) {
-      break;
-    }
-
-    offset += response.items.length;
-  }
-
-  return comments;
-}
-
-async function photoAlreadyHasReservationComment(item) {
-  const comments = await getPhotoComments(item);
-  await waitToAvoidVkRateLimit(2000);
-
-  return comments.some((comment) => String(comment.text || '').toLowerCase().includes('бронь'));
-}
-
-async function createPhotoReservationComment(item, displayName) {
-  const message = `${displayName} — бронь ${item.discount_price} ₽`;
-
-  return vk('photos.createComment', {
-    owner_id: item.photo_owner_id,
-    photo_id: item.photo_id,
-    message,
-    from_group: Math.abs(GROUP_ID),
-  }, ACCESS_TOKEN);
-}
-
-async function replyToReservationComment(postId, comment) {
-  const displayName = comment.mentionName || comment.userName || comment.reservationName || `id${comment.from_id}`;
-  const message = `[id${comment.from_id}|${displayName}], укажите номер лота, пожалуйста. Например: 6 бронь`;
-
-  return vk('wall.createComment', {
-    owner_id: -Math.abs(GROUP_ID),
-    post_id: postId,
-    reply_to_comment: comment.id,
-    message,
-    from_group: Math.abs(GROUP_ID),
-  }, ACCESS_TOKEN);
-}
-
 function printReservationsList() {
   const reservations = listReservations();
 
@@ -780,6 +854,147 @@ function printReservationsList() {
       `raw_comment=${reservation.raw_comment || ''}`,
     ].join(' | '));
   });
+}
+
+function getLocalDayRange(date = new Date()) {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return {
+    start: Math.floor(start.getTime() / 1000),
+    end: Math.floor(end.getTime() / 1000),
+  };
+}
+
+function getLocalMonthRange(date = new Date()) {
+  const start = new Date(date.getFullYear(), date.getMonth(), 1);
+  const end = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+
+  return {
+    start: Math.floor(start.getTime() / 1000),
+    end: Math.floor(end.getTime() / 1000),
+    daysInMonth: new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate(),
+    currentDay: date.getDate(),
+  };
+}
+
+function printApiUsageSection(title, rows) {
+  console.log(title);
+
+  if (rows.length === 0) {
+    console.log('(no VK API calls recorded)');
+    return;
+  }
+
+  rows.forEach((row) => {
+    console.log([
+      `operation=${row.operation || ''}`,
+      `method=${row.method || ''}`,
+      `token=${row.token_type || ''}`,
+      `success=${row.success ? 'true' : 'false'}`,
+      `count=${row.count}`,
+    ].join(' | '));
+  });
+}
+
+function printApiUsage() {
+  const now = new Date();
+  const todayRange = getLocalDayRange(now);
+  const monthRange = getLocalMonthRange(now);
+  const todayRows = getApiUsageRows(todayRange.start, todayRange.end);
+  const monthRows = getApiUsageRows(monthRange.start, monthRange.end);
+  const monthTotal = getApiUsageTotal(monthRange.start, monthRange.end);
+  const total = Number(monthTotal.total || 0);
+  const service = Number(monthTotal.service || 0);
+  const group = Number(monthTotal.group || 0);
+
+  console.log('VK API usage');
+  console.log('');
+  printApiUsageSection('TODAY', todayRows);
+  console.log('');
+  printApiUsageSection('CURRENT CALENDAR MONTH', monthRows);
+  console.log('');
+  console.log(`TOTAL CALLS THIS MONTH: ${total}`);
+  console.log(`SERVICE CALLS: ${service}`);
+  console.log(`GROUP CALLS: ${group}`);
+
+  if (VK_API_MONTHLY_BUDGET > 0) {
+    const remaining = Math.max(0, VK_API_MONTHLY_BUDGET - total);
+    const percent = VK_API_MONTHLY_BUDGET > 0
+      ? (total / VK_API_MONTHLY_BUDGET * 100).toFixed(1)
+      : '0.0';
+
+    console.log('');
+    console.log('VK API monthly usage');
+    console.log(`Used: ${total}`);
+    console.log(`Budget reference: ${VK_API_MONTHLY_BUDGET}`);
+    console.log(`Remaining reference: ${remaining}`);
+    console.log(`Usage: ${percent}%`);
+  }
+
+  if (total > 0 && monthRange.currentDay > 0) {
+    const average = total / monthRange.currentDay;
+    const projected = Math.round(average * monthRange.daysInMonth);
+
+    console.log('');
+    console.log(`Average calls/day: ${average.toFixed(1)}`);
+    console.log(`Projected calls by month end: ${projected}`);
+  }
+}
+
+function printQueueStateCounts(prefix, queueState) {
+  console.log(prefix);
+  console.log(`scheduled_posts: ${queueState.scheduled_posts.length}`);
+  console.log(`post_items: ${queueState.post_items.length}`);
+  console.log(`used_items: ${queueState.used_items.length}`);
+  console.log(`gold_blocks: ${queueState.roulette_gold_blocks.length}`);
+}
+
+function printQueueStateImportSummary(summary) {
+  console.log('Queue state import summary:');
+  console.log(`scheduled_posts inserted: ${summary.scheduledPostsInserted}`);
+  console.log(`scheduled_posts skipped: ${summary.scheduledPostsSkipped}`);
+  console.log(`post_items inserted: ${summary.postItemsInserted}`);
+  console.log(`post_items skipped: ${summary.postItemsSkipped}`);
+  console.log(`used_items inserted: ${summary.usedItemsInserted}`);
+  console.log(`used_items skipped: ${summary.usedItemsSkipped}`);
+  console.log(`gold_blocks inserted: ${summary.goldBlocksInserted}`);
+  console.log(`gold_blocks skipped: ${summary.goldBlocksSkipped}`);
+  console.log(`Future roulette posts: ${summary.futureScheduledPosts}`);
+  console.log(`Next roulette sequence: ${summary.nextRouletteSequenceNumber}`);
+}
+
+function exportQueueState(outputPath = QUEUE_STATE_EXPORT_PATH) {
+  const queueState = getQueueStateExport();
+  const resolvedOutputPath = path.resolve(outputPath);
+
+  fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
+  fs.writeFileSync(resolvedOutputPath, `${JSON.stringify(queueState, null, 2)}\n`);
+
+  console.log(`Queue state exported: ${resolvedOutputPath}`);
+  printQueueStateCounts('Exported counts:', queueState);
+
+  return {
+    outputPath: resolvedOutputPath,
+    queueState,
+  };
+}
+
+function importQueueStateFromFile(inputPath) {
+  if (!inputPath) {
+    throw new Error('Usage: node index.js import-queue-state <file>');
+  }
+
+  const resolvedInputPath = path.resolve(inputPath);
+  const queueState = JSON.parse(fs.readFileSync(resolvedInputPath, 'utf8'));
+  const summary = importQueueState(queueState);
+
+  console.log(`Queue state imported: ${resolvedInputPath}`);
+  printQueueStateImportSummary(summary);
+
+  return summary;
 }
 
 function buildReservationRecord({ postId, comment, item, status }) {
@@ -820,36 +1035,21 @@ function printReservationAction(action, reservation, item) {
 }
 
 async function finalizeConfirmedReservation({ reservation, item, mode }) {
-  let alreadyReserved = false;
-
-  try {
-    alreadyReserved = await photoAlreadyHasReservationComment(item);
-  } catch (error) {
-    console.warn(`Could not read photo comments for ${item.photo_attachment}: ${error.message || error}`);
-  }
-
-  if (alreadyReserved) {
-    console.warn('photo already has reservation comment');
-  }
-
   printReservationAction(mode, reservation, item);
-
-  if (!DRY_RUN && !alreadyReserved) {
-    await createPhotoReservationComment(item, reservation.displayName || reservation.userName);
-    await waitToAvoidVkRateLimit(2000);
-  }
 }
 
 async function fixReservations(postsOverride = null) {
   const posts = Array.isArray(postsOverride) ? postsOverride : listPostsForReservationFix();
 
   if (posts.length === 0) {
-    console.log('No scheduled posts found in DB');
+    console.log('No reservation checks due');
     return;
   }
 
   console.log(`FIX RESERVATIONS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
   console.log(`posts: ${posts.length}`);
+  console.log('Reservation mode: one-shot due posts only');
+  console.log('V1: no photos.createComment, no wall.createComment, no repeated polling');
 
   if (SKIP_UNRESOLVED_REPLIES) {
     console.log('SKIP_UNRESOLVED_REPLIES=true: unresolved replies disabled');
@@ -868,9 +1068,11 @@ async function fixReservations(postsOverride = null) {
     const itemsByNumber = new Map(items.map((item) => [Number(item.item_number), item]));
     const foundItemNumbers = new Set();
     let comments = [];
+    let scanCompleted = false;
 
     try {
       comments = await getWallComments(post.vk_post_id);
+      scanCompleted = true;
     } catch (error) {
       console.warn(`Could not read comments for post ${post.vk_post_id}: ${error.message || error}`);
       continue;
@@ -909,18 +1111,12 @@ async function fixReservations(postsOverride = null) {
 
           if (!itemNumber) {
             if (!DRY_RUN) {
-              const shouldReply = !existingReservation.reply_sent_at && !SKIP_UNRESOLVED_REPLIES;
               updateReservationUnresolvedComment({
                 vkPostId: post.vk_post_id,
                 commentId: comment.id,
                 rawComment: comment.text || '',
-                replySentAt: shouldReply ? Math.floor(Date.now() / 1000) : null,
+                replySentAt: null,
               });
-
-              if (shouldReply) {
-                await replyToReservationComment(post.vk_post_id, comment);
-                await waitToAvoidVkRateLimit(2000);
-              }
             }
             stats.unresolved += 1;
             continue;
@@ -930,18 +1126,12 @@ async function fixReservations(postsOverride = null) {
 
           if (!item) {
             if (!DRY_RUN) {
-              const shouldReply = !existingReservation.reply_sent_at && !SKIP_UNRESOLVED_REPLIES;
               updateReservationUnresolvedComment({
                 vkPostId: post.vk_post_id,
                 commentId: comment.id,
                 rawComment: comment.text || '',
-                replySentAt: shouldReply ? Math.floor(Date.now() / 1000) : null,
+                replySentAt: null,
               });
-
-              if (shouldReply) {
-                await replyToReservationComment(post.vk_post_id, comment);
-                await waitToAvoidVkRateLimit(2000);
-              }
             }
             stats.unresolved += 1;
             continue;
@@ -983,13 +1173,8 @@ async function fixReservations(postsOverride = null) {
         printReservationAction(DRY_RUN ? 'Would save unresolved reservation' : 'Unresolved reservation', reservation, null);
 
         if (!DRY_RUN) {
-          reservation.replySentAt = SKIP_UNRESOLVED_REPLIES ? null : Math.floor(Date.now() / 1000);
+          reservation.replySentAt = null;
           saveReservation(reservation);
-
-          if (!SKIP_UNRESOLVED_REPLIES) {
-            await replyToReservationComment(post.vk_post_id, comment);
-            await waitToAvoidVkRateLimit(2000);
-          }
         }
 
         stats.unresolved += 1;
@@ -1019,6 +1204,11 @@ async function fixReservations(postsOverride = null) {
         mode: DRY_RUN ? 'Would save confirmed reservation' : 'Confirmed reservation',
       });
       stats.confirmed += 1;
+    }
+
+    if (scanCompleted && !DRY_RUN) {
+      markReservationsChecked(post.vk_post_id);
+      console.log(`reservations_checked_at set for post ${post.vk_post_id}`);
     }
 
     await waitToAvoidVkRateLimit(2000);
@@ -1151,9 +1341,12 @@ function buildOverlaySvg() {
   `);
 }
 
-async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
+async function vk(method, params = {}, accessToken, options = {}) {
+  const operation = options.operation || 'general';
+  const tokenType = options.tokenType || 'unknown';
+
   if (!accessToken) {
-    throw new Error('VK_USER_TOKEN пустой');
+    throw new Error(options.missingTokenMessage || 'VK token is empty');
   }
 
   const maxAttempts = 3;
@@ -1171,6 +1364,14 @@ async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
         },
       });
     } catch (error) {
+      recordVkApiUsage({
+        operation,
+        method,
+        tokenType,
+        success: false,
+        errorKind: error.code || error.message || 'network',
+      });
+
       if (attempt < maxAttempts) {
         const delayMs = 3000 + Math.floor(Math.random() * 2001);
         console.warn(`VK request failed on ${method}: ${error.code || error.message || error}. Retry ${attempt + 1}/${maxAttempts} after ${delayMs} ms`);
@@ -1183,6 +1384,14 @@ async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
 
     if (response.data.error) {
       const { error_code: code, error_msg: message } = response.data.error;
+      recordVkApiUsage({
+        operation,
+        method,
+        tokenType,
+        success: false,
+        vkErrorCode: code,
+        errorKind: message,
+      });
 
       if (code === 6 && attempt < maxAttempts) {
         const delayMs = 3000 + Math.floor(Math.random() * 2001);
@@ -1198,6 +1407,12 @@ async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
       throw error;
     }
 
+    recordVkApiUsage({
+      operation,
+      method,
+      tokenType,
+      success: true,
+    });
     await sleep(350);
     return response.data.response;
   }
@@ -1206,12 +1421,40 @@ async function vk(method, params = {}, accessToken = ACCESS_TOKEN) {
 }
 
 async function vkRead(method, params = {}) {
-  return vk(method, params, ACCESS_TOKEN);
+  return vk(method, params, SERVICE_TOKEN, {
+    operation: 'catalogue',
+    tokenType: 'service',
+    missingTokenMessage: 'VK_SERVICE_TOKEN пустой',
+  });
+}
+
+async function vkQueue(method, params = {}) {
+  return vk(method, params, SERVICE_TOKEN, {
+    operation: 'queue',
+    tokenType: 'service',
+    missingTokenMessage: 'VK_SERVICE_TOKEN пустой',
+  });
+}
+
+async function vkReservation(method, params = {}) {
+  return vk(method, params, SERVICE_TOKEN, {
+    operation: 'reservation',
+    tokenType: 'service',
+    missingTokenMessage: 'VK_SERVICE_TOKEN пустой',
+  });
+}
+
+async function vkPosting(method, params = {}) {
+  return vk(method, params, GROUP_TOKEN, {
+    operation: 'posting',
+    tokenType: 'group',
+    missingTokenMessage: 'VK_GROUP_TOKEN пустой',
+  });
 }
 
 async function publishDelayedPost(postText, attachments, publishDate) {
-  if (!POST_TOKEN) {
-    throw new Error('VK_USER_TOKEN пустой');
+  if (!GROUP_TOKEN) {
+    throw new Error('VK_GROUP_TOKEN пустой');
   }
 
   logPublishDateDebug(publishDate);
@@ -1222,11 +1465,13 @@ async function publishDelayedPost(postText, attachments, publishDate) {
     message: postText,
     attachments,
     publish_date: publishDate,
+    primary_attachments_mode: PRIMARY_ATTACHMENTS_MODE,
   };
 
   console.log('wall.post params:');
   console.log(`owner_id: ${wallPostParams.owner_id}`);
   console.log(`publish_date: ${wallPostParams.publish_date}`);
+  console.log(`primary_attachments_mode: ${wallPostParams.primary_attachments_mode}`);
   console.log(`attachments: ${wallPostParams.attachments}`);
   console.log(`message: ${wallPostParams.message}`);
   console.log(`new Date(publish_date * 1000).toString(): ${new Date(wallPostParams.publish_date * 1000).toString()}`);
@@ -1234,7 +1479,7 @@ async function publishDelayedPost(postText, attachments, publishDate) {
   console.log(`new Date(publish_date * 1000).toLocaleString(): ${new Date(wallPostParams.publish_date * 1000).toLocaleString()}`);
   console.log(`Intl.DateTimeFormat().resolvedOptions().timeZone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
 
-  return vk('wall.post', wallPostParams, POST_TOKEN);
+  return vkPosting('wall.post', wallPostParams);
 }
 
 async function getAlbumPhotos(albumId) {
@@ -1247,7 +1492,7 @@ async function getAlbumPhotos(albumId) {
     const response = await vkRead('photos.get', {
       owner_id: ownerId,
       album_id: albumId,
-      extended: 0,
+      extended: 1,
       photo_sizes: 1,
       count,
       offset,
@@ -1263,6 +1508,22 @@ async function getAlbumPhotos(albumId) {
   }
 
   return photos;
+}
+
+async function getCatalogueAlbumIds(configAlbumIds) {
+  const configuredIds = new Set(configAlbumIds.map((albumId) => Number(albumId)));
+  const response = await vkRead('photos.getAlbums', {
+    owner_id: -Math.abs(GROUP_ID),
+    need_system: 0,
+    count: 1000,
+  });
+  const albumIds = (response.items || []).map((album) => Number(album.id));
+
+  if (configuredIds.size === 0) {
+    return albumIds;
+  }
+
+  return albumIds.filter((albumId) => configuredIds.has(albumId));
 }
 
 function normalizePhoto(photo, albumId) {
@@ -1284,6 +1545,7 @@ function normalizePhoto(photo, albumId) {
     attachment: `photo${photo.owner_id}_${photo.id}`,
     imageUrl,
     imageUrls,
+    commentsCount: typeof photo.comments?.count === 'number' ? photo.comments.count : null,
   };
 }
 
@@ -1731,92 +1993,6 @@ async function createPreviewImage(items, outputPath = PREVIEW_PATH) {
   return outputPath;
 }
 
-async function uploadWallPhoto(filePath) {
-  if (!POST_TOKEN) {
-    throw new Error('VK_USER_TOKEN пустой');
-  }
-
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const uploadServer = await vk('photos.getWallUploadServer', {
-        group_id: Math.abs(GROUP_ID),
-      }, POST_TOKEN);
-
-      const form = new FormData();
-      form.append('photo', fs.createReadStream(filePath));
-
-      const uploadResponse = await axios.post(uploadServer.upload_url, form, {
-        headers: form.getHeaders(),
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        timeout: UPLOAD_REQUEST_TIMEOUT_MS,
-      });
-
-      console.log('Upload response:');
-      console.log(JSON.stringify(uploadResponse.data, null, 2));
-
-      if (uploadResponse.data.error) {
-        throw new Error(`VK photo upload error: ${uploadResponse.data.error}`);
-      }
-
-      if (!uploadResponse.data.photo || !uploadResponse.data.server || !uploadResponse.data.hash) {
-        throw new Error('Preview upload failed: upload response is missing photo/server/hash');
-      }
-
-      console.log('Saving wall photo...');
-      const savedPhotos = await vk('photos.saveWallPhoto', {
-        group_id: Math.abs(GROUP_ID),
-        photo: uploadResponse.data.photo,
-        server: uploadResponse.data.server,
-        hash: uploadResponse.data.hash,
-      }, POST_TOKEN);
-
-      console.log('Save response:');
-      console.log(JSON.stringify(savedPhotos, null, 2));
-      console.log('Saved.');
-
-      const [photo] = Array.isArray(savedPhotos) ? savedPhotos : [];
-
-      if (!photo) {
-        throw new Error('Preview upload failed: photo is undefined');
-      }
-
-      const previewAttachment = `photo${photo.owner_id}_${photo.id}`;
-
-      console.log(`Preview attachment: ${previewAttachment}`);
-
-      if (!isValidPhotoAttachment(previewAttachment)) {
-        throw new Error('Preview upload failed: photo is undefined');
-      }
-
-      return previewAttachment;
-    } catch (error) {
-      lastError = error;
-      console.warn(`Preview upload attempt ${attempt} failed: ${error.message || error}`);
-
-      if (attempt < 3) {
-        await sleep(1500);
-      }
-    }
-  }
-
-  throw lastError;
-}
-
-async function getPostponedWallPosts() {
-  const response = await vkRead('wall.get', {
-    owner_id: -Math.abs(GROUP_ID),
-    filter: 'postponed',
-    count: 100,
-  });
-
-  await sleep(1000);
-
-  return response.items || [];
-}
-
 function buildMissingQueueDates(existingQueuePosts, queueDays, publishTime) {
   const existingDateKeys = new Set(
     existingQueuePosts.map((post) => formatDateForFile(new Date(post.date * 1000))),
@@ -1862,31 +2038,39 @@ function buildTestQueueDates(existingQueuePosts, postsCount, publishTime) {
 async function getQueueCandidateItems(albumIds) {
   const products = [];
   let loadedPhotos = 0;
+  const catalogueAlbumIds = await getCatalogueAlbumIds(albumIds);
+  let photosWithCommentCounters = 0;
 
-  for (const albumId of albumIds) {
+  for (const albumId of catalogueAlbumIds) {
     const photos = await getAlbumPhotos(albumId);
     loadedPhotos += photos.length;
     photos.forEach((photo) => {
       const item = normalizePhoto(photo, albumId);
 
       if (item) {
+        if (typeof item.commentsCount === 'number') {
+          photosWithCommentCounters += 1;
+        }
+
         products.push(item);
       }
     });
   }
 
   console.log(`Loaded photos: ${loadedPhotos}`);
+  console.log(`Photos with catalogue comment counters: ${photosWithCommentCounters}`);
+  if (photosWithCommentCounters === 0) {
+    console.log('Product comment exclusion via photos.getComments is disabled for service-token migration.');
+  }
   return products;
 }
 
 async function photoHasAnyComments(item) {
-  const response = await vkRead('photos.getComments', {
-    owner_id: item.ownerId,
-    photo_id: item.id,
-    count: 1,
-  });
+  if (typeof item.commentsCount === 'number') {
+    return item.commentsCount > 0;
+  }
 
-  return Number(response.count || 0) > 0;
+  return false;
 }
 
 function splitQueueCandidates(candidates, usedPhotoHistory, futureScheduledAttachments, reuseAfterDays) {
@@ -1973,9 +2157,9 @@ async function selectQueueItems(
 
   console.log(`Cheap filter: ${unusedCandidates.length}`);
 
-  console.log('Checking comments...');
+  console.log('Checking catalogue comment counters...');
   const selected = await selectFromCandidateWindows(unusedCandidates, itemsPerPost, candidatePoolSize);
-  console.log('Comments checked.');
+  console.log('Catalogue comment counters checked.');
 
   if (selected.length >= itemsPerPost) {
     return selected;
@@ -1986,26 +2170,102 @@ async function selectQueueItems(
   }
 
   console.log(`Cooldown reusable candidates: ${reusableCandidates.length}`);
-  console.log('Checking comments...');
+  console.log('Checking catalogue comment counters...');
   const reusableSelected = await selectFromCandidateWindows(
     reusableCandidates,
     itemsPerPost - selected.length,
     candidatePoolSize,
   );
-  console.log('Comments checked.');
+  console.log('Catalogue comment counters checked.');
 
   return [...selected, ...reusableSelected];
 }
 
+async function selectUniqueQueueItems(
+  candidates,
+  usedPhotoHistory,
+  futureScheduledAttachments,
+  itemsPerPost,
+  candidatePoolSize,
+  reuseAfterDays,
+) {
+  const duplicateContentExclusions = new Set();
+  const maxAttempts = 10;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const selectionExclusions = new Set([
+      ...futureScheduledAttachments,
+      ...duplicateContentExclusions,
+    ]);
+    const items = await selectQueueItems(
+      candidates,
+      usedPhotoHistory,
+      selectionExclusions,
+      itemsPerPost,
+      candidatePoolSize,
+      reuseAfterDays,
+    );
+
+    if (items.length < itemsPerPost) {
+      return {
+        items,
+        fingerprint: buildProductFingerprint(items),
+        duplicate: null,
+      };
+    }
+
+    const fingerprint = buildProductFingerprint(items);
+    const duplicate = getScheduledPostByProductFingerprint(fingerprint);
+
+    console.log(`Product fingerprint: ${fingerprint}`);
+
+    if (!duplicate) {
+      return {
+        items,
+        fingerprint,
+        duplicate: null,
+      };
+    }
+
+    console.warn([
+      'Duplicate roulette product set found:',
+      `vk_post_id=${duplicate.vk_post_id}`,
+      `status=${duplicate.status}`,
+      `publish_date=${duplicate.publish_date_text || duplicate.publish_date}`,
+    ].join(' '));
+
+    items.forEach((item) => {
+      duplicateContentExclusions.add(item.attachment);
+    });
+  }
+
+  throw new Error('Could not select a unique roulette product set');
+}
+
 function getFutureScheduledProductAttachments(posts) {
   const attachments = new Set();
+  const staticCardAttachments = new Set([
+    String(ROULETTE_CARD_ATTACHMENT || '').trim(),
+    String(ROULETTE_GOLD_CARD_ATTACHMENT || '').trim(),
+  ].filter(Boolean));
 
   posts.forEach((post) => {
-    getWallPostPhotoAttachments(post)
-      .slice(1)
-      .forEach((photo) => {
-        attachments.add(`photo${photo.owner_id}_${photo.id}`);
+    if (!Array.isArray(post.attachments)) {
+      getPostItems(post.vk_post_id || post.id).forEach((item) => {
+        if (item.photo_attachment && !staticCardAttachments.has(item.photo_attachment)) {
+          attachments.add(item.photo_attachment);
+        }
       });
+      return;
+    }
+
+    getWallPostPhotoAttachments(post).forEach((photo) => {
+      const attachment = `photo${photo.owner_id}_${photo.id}`;
+
+      if (!staticCardAttachments.has(attachment)) {
+        attachments.add(attachment);
+      }
+    });
   });
 
   return attachments;
@@ -2019,18 +2279,44 @@ async function createScheduledPost(targetDate, context) {
     itemsPerPost,
     candidatePoolSize,
     reuseAfterDays,
+    sequenceNumber,
+    goldBlockCache,
   } = context;
 
   console.log('');
   console.log('-------------------------');
   console.log('Creating scheduled post:');
   console.log(`Target date: ${formatPublishDate(toUnixTimestamp(targetDate))}`);
+  console.log('READ TOKEN: SERVICE');
+  console.log('WRITE TOKEN: GROUP');
 
   try {
+    const assignment = createRouletteAssignment(sequenceNumber, {
+      persist: !DRY_RUN,
+      goldBlockCache,
+    });
+    const rouletteCardAttachment = String(assignment.cardAttachment || '').trim();
+
+    if (!isValidPhotoAttachment(rouletteCardAttachment)) {
+      const tokenName = assignment.variant === 'gold'
+        ? 'VK_ROULETTE_GOLD_CARD_ATTACHMENT'
+        : 'VK_ROULETTE_CARD_ATTACHMENT';
+      throw new Error(`${tokenName} пустой или имеет неверный формат`);
+    }
+
+    console.log(`Roulette sequence: ${assignment.sequenceNumber}`);
+    console.log(`Block: ${assignment.blockNumber}`);
+    console.log(`Variant: ${assignment.variant.toUpperCase()}`);
+    if (assignment.variant === 'gold') {
+      console.log('*** GOLDEN SECTOR ***');
+    }
+    console.log(`Discount: ${assignment.discountPercent}`);
+    console.log(`Card attachment: ${rouletteCardAttachment}`);
+
     console.log('Selecting candidates...');
-    const items = await withOperationTimeout(
+    const selection = await withOperationTimeout(
       'Selecting candidates',
-      () => selectQueueItems(
+      () => selectUniqueQueueItems(
         candidates,
         usedPhotoHistory,
         futureScheduledAttachments,
@@ -2040,64 +2326,16 @@ async function createScheduledPost(targetDate, context) {
       ),
       OPERATION_TIMEOUT_MS,
     );
+    const { items, fingerprint: productFingerprint } = selection;
     console.log('Candidates selected.');
 
     if (items.length < itemsPerPost) {
       throw new Error('Not enough available products');
     }
+    console.log(`Unique product fingerprint: ${productFingerprint}`);
 
-    const previewPath = path.join(OUTPUT_DIR, `queue-preview-${formatDateForFile(targetDate)}.jpg`);
-    console.log('Generating preview...');
-    const previewFile = await withOperationTimeout(
-      'Generating preview',
-      () => createPreviewImage(items, previewPath),
-      OPERATION_TIMEOUT_MS,
-    );
-    console.log('Preview generated.');
-    console.log(`Preview path: ${previewFile}`);
-
-    const postText = buildPostText(items);
-
-    if (DRY_RUN) {
-      const publishTimestamp = toUnixTimestamp(targetDate);
-      const attachments = buildWallAttachments(items);
-
-      if (!attachments) {
-        throw new Error('Attachments are undefined');
-      }
-
-      const attachmentsInfo = getAttachmentsInfo(attachments);
-      console.log(`Attachments count: ${attachmentsInfo.count}`);
-      console.log(`First attachment: ${attachmentsInfo.first}`);
-      logPublishDateDebug(publishTimestamp);
-      console.log(`DRY_RUN=true: wall.post skipped`);
-      printDbSavePreview(null, publishTimestamp, formatPublishDate(publishTimestamp), buildDbItems(items));
-      console.log('-------------------------');
-      return {
-        ok: true,
-        dryRun: true,
-        saved: false,
-        items,
-        usedAt: publishTimestamp,
-        publishTimestamp,
-      };
-    }
-
-    console.log('Uploading preview...');
-    const previewAttachment = await withOperationTimeout(
-      'Uploading preview',
-      () => uploadWallPhoto(previewFile),
-      OPERATION_TIMEOUT_MS * 3,
-    );
-    console.log('Preview uploaded.');
-
-    if (!isValidPhotoAttachment(previewAttachment)) {
-      throw new Error('Preview upload failed: photo is undefined');
-    }
-
-    await sleep(1000);
-
-    const attachments = buildWallAttachments(items, previewAttachment);
+    const postText = buildPostText(items, assignment);
+    const attachments = buildWallAttachments(items, rouletteCardAttachment);
 
     if (!attachments) {
       throw new Error('Attachments are undefined');
@@ -2109,8 +2347,36 @@ async function createScheduledPost(targetDate, context) {
       throw new Error('Attachments validation failed');
     }
 
+    console.log('Selected 8 product attachments:');
+    items.forEach((item, index) => {
+      console.log(`${index + 1}. ${item.attachment}`);
+    });
+    console.log(`Static roulette card: ${rouletteCardAttachment}`);
+    console.log('Final 9 attachments in exact order:');
+    String(attachments).split(',').forEach((attachment, index) => {
+      console.log(`${index + 1}. ${attachment}`);
+    });
     console.log(`Attachments count: ${attachmentsInfo.count}`);
     console.log(`First attachment: ${attachmentsInfo.first}`);
+    console.log(`Primary attachments mode: ${PRIMARY_ATTACHMENTS_MODE}`);
+
+    if (DRY_RUN) {
+      const publishTimestamp = toUnixTimestamp(targetDate);
+      logPublishDateDebug(publishTimestamp);
+      console.log(`DRY_RUN=true: wall.post skipped`);
+      printDbSavePreview(null, publishTimestamp, formatPublishDate(publishTimestamp), buildDbItems(items, assignment.discountPercent));
+      console.log(`scheduled_posts.product_fingerprint: ${productFingerprint}`);
+      console.log('-------------------------');
+      return {
+        ok: true,
+        dryRun: true,
+        saved: false,
+        items,
+        usedAt: publishTimestamp,
+        publishTimestamp,
+        assignment,
+      };
+    }
     console.log('Creating wall.post...');
 
     const publishResult = await withOperationTimeout(
@@ -2134,7 +2400,14 @@ async function createScheduledPost(targetDate, context) {
       vkPostId,
       publishDate: publishResult.publishTimestamp,
       publishDateText: formatPublishDate(publishResult.publishTimestamp),
-      items: buildDbItems(items),
+      items: buildDbItems(items, assignment.discountPercent),
+      variant: assignment.variant,
+      discountPercent: assignment.discountPercent,
+      cardAttachment: rouletteCardAttachment,
+      rouletteSequenceNumber: assignment.sequenceNumber,
+      goldBlockNumber: assignment.blockNumber,
+      goldPosition: assignment.goldPosition,
+      productFingerprint,
     });
 
     if (!dbResult.saved) {
@@ -2153,6 +2426,7 @@ async function createScheduledPost(targetDate, context) {
       items,
       usedAt: publishResult.publishTimestamp,
       publishTimestamp: publishResult.publishTimestamp,
+      assignment,
     };
   } catch (error) {
     console.error(`Scheduled post failed: ${error.message || error}`);
@@ -2177,18 +2451,18 @@ async function ensureQueue() {
     throw new Error('В config.json не указаны albums');
   }
 
-  console.log('Loading postponed posts...');
-  const postponedPosts = await withOperationTimeout(
-    'Loading postponed posts',
-    () => getPostponedWallPosts(),
-    OPERATION_TIMEOUT_MS,
-  );
+  console.log('Queue source of truth: SQLite scheduled_posts');
+  console.log('VK postponed reconciliation is disabled for normal ensure-queue maintenance.');
+  console.log('Loading local future scheduled posts...');
   const nowTimestamp = Math.floor(Date.now() / 1000);
-  const rouletteQueuePosts = postponedPosts
-    .filter((post) => post.date > nowTimestamp)
-    .filter(isRoulettePost)
-    .sort((a, b) => a.date - b.date);
-  console.log('Postponed posts loaded.');
+  const rouletteQueuePosts = listFutureScheduledPosts(nowTimestamp)
+    .map((post) => ({
+      ...post,
+      id: post.vk_post_id,
+      date: post.publish_date,
+      text: '#CP_СкидочнаяРулетка',
+    }));
+  console.log('Local future scheduled posts loaded.');
 
   console.log(`Future roulette posts: ${rouletteQueuePosts.length}`);
   console.log(`queueDays: ${queueDays}`);
@@ -2212,6 +2486,7 @@ async function ensureQueue() {
   }
   console.log(`queueDays: ${queueDays}`);
   console.log(`Need to create: ${missingDates.length}`);
+  console.log(`Primary attachments mode: ${PRIMARY_ATTACHMENTS_MODE}`);
   console.log('Target dates:');
   if (missingDates.length === 0) {
     console.log('(none)');
@@ -2264,6 +2539,8 @@ async function ensureQueue() {
     skipped: 0,
     failed: 0,
   };
+  let nextSequenceNumber = getNextRouletteSequenceNumber();
+  const goldBlockCache = new Map();
 
   for (const publishDate of missingDates) {
     let targetDate = new Date(publishDate);
@@ -2280,12 +2557,16 @@ async function ensureQueue() {
       itemsPerPost,
       candidatePoolSize,
       reuseAfterDays,
+      sequenceNumber: nextSequenceNumber,
+      goldBlockCache,
     });
 
     if (!createdPost.ok) {
       summary.failed += 1;
       continue;
     }
+
+    nextSequenceNumber += 1;
 
     if (createdPost.saved) {
       summary.created += 1;
@@ -2392,6 +2673,21 @@ async function main() {
     return;
   }
 
+  if (command === 'api-usage') {
+    printApiUsage();
+    return;
+  }
+
+  if (command === 'export-queue-state') {
+    exportQueueState(commandArg || QUEUE_STATE_EXPORT_PATH);
+    return;
+  }
+
+  if (command === 'import-queue-state') {
+    importQueueStateFromFile(commandArg);
+    return;
+  }
+
   if (command === 'reimport-post') {
     const vkPostId = Number(commandArg);
 
@@ -2434,7 +2730,6 @@ async function main() {
 
   console.log('TOKEN USAGE:');
   console.log(`photos.get: ${getReadTokenName()}`);
-  console.log(`upload preview image: ${getPostTokenName()}`);
   console.log(`wall.post: ${getPostTokenName()}`);
   console.log('');
 
@@ -2458,39 +2753,28 @@ async function main() {
   let nextPublishDate = plans[0] ? new Date(plans[0].publishDate) : null;
 
   for (const plan of plans) {
-    const previewPath = await createPreviewImage(plan.items, plan.previewPath);
-    let previewAttachment = '';
+    const rouletteCardAttachment = String(ROULETTE_CARD_ATTACHMENT || '').trim();
     let publishResult = null;
     let actualPublishTimestamp = plan.publishTimestamp;
-    let uploadFailed = false;
 
-    if (!DRY_RUN) {
-      try {
-        previewAttachment = await uploadWallPhoto(previewPath);
-        await sleep(1000);
-      } catch (error) {
-        uploadFailed = true;
-        console.error(error.message || error);
-      }
-
-      if (uploadFailed || !isValidPhotoAttachment(previewAttachment)) {
-        console.error('Preview upload failed: photo is undefined');
-        nextPublishDate = addDays(nextPublishDate, 1);
-      } else {
-        const attachmentsForPost = buildWallAttachments(plan.items, previewAttachment);
-        const attachmentsInfo = getAttachmentsInfo(attachmentsForPost);
-
-        console.log('ATTACHMENTS BEFORE WALL.POST:');
-        console.log(`count: ${attachmentsInfo.count}`);
-        console.log(`first: ${attachmentsInfo.first}`);
-
-        publishResult = await publishDelayedPostSkippingTakenDates(plan.postText, attachmentsForPost, nextPublishDate);
-        nextPublishDate = addDays(publishResult.publishDate, 1);
-        actualPublishTimestamp = publishResult.publishTimestamp;
-      }
+    if (!isValidPhotoAttachment(rouletteCardAttachment)) {
+      throw new Error('VK_ROULETTE_CARD_ATTACHMENT пустой или имеет неверный формат');
     }
 
-    const attachments = buildWallAttachments(plan.items, previewAttachment);
+    if (!DRY_RUN) {
+      const attachmentsForPost = buildWallAttachments(plan.items, rouletteCardAttachment);
+      const attachmentsInfo = getAttachmentsInfo(attachmentsForPost);
+
+      console.log('ATTACHMENTS BEFORE WALL.POST:');
+      console.log(`count: ${attachmentsInfo.count}`);
+      console.log(`first: ${attachmentsInfo.first}`);
+
+      publishResult = await publishDelayedPostSkippingTakenDates(plan.postText, attachmentsForPost, nextPublishDate);
+      nextPublishDate = addDays(publishResult.publishDate, 1);
+      actualPublishTimestamp = publishResult.publishTimestamp;
+    }
+
+    const attachments = buildWallAttachments(plan.items, rouletteCardAttachment);
 
     console.log('');
     console.log(`POST #${plan.index}`);
@@ -2500,8 +2784,8 @@ async function main() {
     console.log('SELECTED ITEMS:');
     console.log(formatItemList(plan.items));
     console.log('');
-    console.log('PREVIEW IMAGE:');
-    console.log(previewPath);
+    console.log('STATIC ROULETTE CARD:');
+    console.log(rouletteCardAttachment);
     console.log('');
     console.log('ATTACHMENTS:');
     console.log(attachments);
@@ -2509,13 +2793,13 @@ async function main() {
     if (DRY_RUN) {
       printDbSavePreview(null, actualPublishTimestamp, formatPublishDate(actualPublishTimestamp), buildDbItems(plan.items));
       console.log('');
-      console.log('DRY_RUN=true: preview was not uploaded and wall.post was not created');
+      console.log('DRY_RUN=true: static card was not uploaded and wall.post was not created');
       continue;
     }
 
     if (!publishResult) {
       console.log('');
-      console.log('Post skipped because preview upload failed');
+      console.log('Post skipped because wall.post failed');
       continue;
     }
 
@@ -2533,6 +2817,7 @@ async function main() {
       publishDate: actualPublishTimestamp,
       publishDateText: formatPublishDate(actualPublishTimestamp),
       items: buildDbItems(plan.items),
+      productFingerprint: buildProductFingerprint(plan.items),
     });
 
     if (dbResult.saved) {
@@ -2560,11 +2845,13 @@ module.exports = {
   main,
   vk,
   parsePrice,
+  calculateDiscountPrice,
   buildPostText,
   buildWallAttachments,
+  buildProductFingerprint,
+  buildDbItems,
   createPreviewImage,
   buildScheduledPostPlans,
-  uploadWallPhoto,
   getAllAvailableItems,
   publishDelayedPost,
   parseReservationItemNumber,
