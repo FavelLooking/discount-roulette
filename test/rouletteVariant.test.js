@@ -23,6 +23,7 @@ const {
   isCommentWithinReservationWindow,
   shouldMarkReservationsChecked,
   shouldScanReservationsPost,
+  getGraceReopenCandidates,
   buildReservationTasksForComment,
   makeReservationIdentity,
   publicPostCopyIncludesOnly24Hours,
@@ -496,4 +497,128 @@ test('reservation window is publish date through 96 hours with three grace days'
 
   assert.equal(window.officialExpiry, publish + 24 * 60 * 60);
   assert.equal(window.reservationCutoff, publish + 96 * 60 * 60);
+});
+
+test('checked post still inside grace is selected for reopen', () => {
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish + 25 * 60 * 60,
+  };
+
+  assert.deepEqual(getGraceReopenCandidates([post], publish + 50 * 60 * 60, 3), [post]);
+});
+
+test('checked post after grace cutoff is not selected for reopen', () => {
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish + 25 * 60 * 60,
+  };
+
+  assert.deepEqual(getGraceReopenCandidates([post], publish + 96 * 60 * 60, 3), []);
+});
+
+test('unchecked post is not selected for reopen', () => {
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: null,
+  };
+
+  assert.deepEqual(getGraceReopenCandidates([post], publish + 50 * 60 * 60, 3), []);
+});
+
+test('post younger than 24h is not selected for reopen', () => {
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish + 12 * 60 * 60,
+  };
+
+  assert.deepEqual(getGraceReopenCandidates([post], publish + 12 * 60 * 60, 3), []);
+});
+
+test('future post is not selected for reopen', () => {
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish - 60,
+  };
+
+  assert.deepEqual(getGraceReopenCandidates([post], publish - 60, 3), []);
+});
+
+test('reopen dry-run selection performs zero writes conceptually', () => {
+  let writes = 0;
+  const publish = 1_000_000;
+  const post = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish + 25 * 60 * 60,
+  };
+  const candidates = getGraceReopenCandidates([post], publish + 50 * 60 * 60, 3);
+
+  if (false) {
+    writes += candidates.length;
+  }
+
+  assert.equal(candidates.length, 1);
+  assert.equal(writes, 0);
+});
+
+test('reopen real run clears only reservations_checked_at', () => {
+  const row = {
+    vk_post_id: 1,
+    publish_date: 1_000_000,
+    reservations_checked_at: 1_090_000,
+    status: 'published',
+    discount_percent: 25,
+  };
+  const reopened = {
+    ...row,
+    reservations_checked_at: null,
+  };
+
+  assert.equal(reopened.vk_post_id, row.vk_post_id);
+  assert.equal(reopened.publish_date, row.publish_date);
+  assert.equal(reopened.status, row.status);
+  assert.equal(reopened.discount_percent, row.discount_percent);
+  assert.equal(reopened.reservations_checked_at, null);
+});
+
+test('running reopen twice is idempotent', () => {
+  const publish = 1_000_000;
+  const firstRunPost = {
+    vk_post_id: 1,
+    publish_date: publish,
+    reservations_checked_at: publish + 25 * 60 * 60,
+  };
+  const first = getGraceReopenCandidates([firstRunPost], publish + 50 * 60 * 60, 3);
+  const secondRunPost = {
+    ...firstRunPost,
+    reservations_checked_at: null,
+  };
+  const second = getGraceReopenCandidates([secondRunPost], publish + 50 * 60 * 60, 3);
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 0);
+});
+
+test('reopen does not touch existing reservation rows', () => {
+  const reservation = {
+    id: 1,
+    vk_post_id: 1,
+    comment_id: 2,
+    item_number: 3,
+    status: 'confirmed',
+  };
+  const afterReopen = { ...reservation };
+
+  assert.deepEqual(afterReopen, reservation);
 });

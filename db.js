@@ -927,6 +927,30 @@ function listPostsForReservationFix() {
   `).all(now);
 }
 
+function listCheckedReservationPosts() {
+  return db.prepare(`
+    SELECT
+      id,
+      vk_post_id,
+      publish_date,
+      publish_date_text,
+      delete_after,
+      status,
+      created_at,
+      reservations_checked_at,
+      variant,
+      discount_percent,
+      card_attachment,
+      roulette_sequence_number,
+      gold_block_number,
+      gold_position,
+      product_fingerprint
+    FROM scheduled_posts
+    WHERE reservations_checked_at IS NOT NULL
+    ORDER BY publish_date ASC, id ASC
+  `).all();
+}
+
 function listFutureScheduledPosts(now = Math.floor(Date.now() / 1000)) {
   return db.prepare(`
     SELECT
@@ -989,6 +1013,28 @@ function markReservationsChecked(vkPostId, checkedAt = Math.floor(Date.now() / 1
     SET reservations_checked_at = ?
     WHERE vk_post_id = ?
   `).run(checkedAt, vkPostId);
+}
+
+function reopenReservationsChecked(vkPostIds) {
+  if (!Array.isArray(vkPostIds) || vkPostIds.length === 0) {
+    return {
+      updated: 0,
+    };
+  }
+
+  const update = db.prepare(`
+    UPDATE scheduled_posts
+    SET reservations_checked_at = NULL
+    WHERE vk_post_id = ?
+      AND reservations_checked_at IS NOT NULL
+  `);
+  const transaction = db.transaction(() => vkPostIds.reduce((updated, vkPostId) => (
+    updated + update.run(vkPostId).changes
+  ), 0));
+
+  return {
+    updated: transaction(),
+  };
 }
 
 function markScheduledPostPublished(vkPostId, publishDate = null) {
@@ -1651,9 +1697,11 @@ module.exports = {
   getScheduledPost,
   getLatestScheduledPost,
   listPostsForReservationFix,
+  listCheckedReservationPosts,
   listFutureScheduledPosts,
   listPostsForReservationFixByIds,
   markReservationsChecked,
+  reopenReservationsChecked,
   markScheduledPostPublished,
   getNextRouletteSequenceNumber,
   getScheduledPostByProductFingerprint,

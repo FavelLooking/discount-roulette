@@ -16,9 +16,11 @@ const {
   getScheduledPost,
   getLatestScheduledPost,
   listPostsForReservationFix,
+  listCheckedReservationPosts,
   listFutureScheduledPosts,
   listPostsForReservationFixByIds,
   markReservationsChecked,
+  reopenReservationsChecked,
   markScheduledPostPublished,
   getNextRouletteSequenceNumber,
   getScheduledPostByProductFingerprint,
@@ -816,6 +818,19 @@ function publicPostCopyIncludesOnly24Hours(text) {
     && !String(text || '').includes('96')
     && !String(text || '').includes('3 дня');
 }
+
+function getGraceReopenCandidates(posts, now = Math.floor(Date.now() / 1000), graceDays = RESERVATION_GRACE_DAYS) {
+  return posts.filter((post) => {
+    if (!post.reservations_checked_at) {
+      return false;
+    }
+
+    const { officialExpiry, reservationCutoff } = getReservationWindow(post, graceDays);
+
+    return now >= officialExpiry && now < reservationCutoff;
+  });
+}
+
 function getUserNames(comment, profilesById, groupsById) {
   if (comment.from_id > 0) {
     const profile = profilesById.get(comment.from_id) || {};
@@ -1119,6 +1134,47 @@ function backfillPhotoComments() {
 
   const result = backfillPhotoCommentPending(sinceTimestamp);
   console.log(`Backfilled reservations: ${result.updated}`);
+}
+
+function reopenGraceReservations() {
+  const now = Math.floor(Date.now() / 1000);
+  const checkedPosts = listCheckedReservationPosts();
+  const candidates = getGraceReopenCandidates(checkedPosts, now);
+
+  console.log(`REOPEN GRACE RESERVATIONS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
+  console.log(`RESERVATION_GRACE_DAYS: ${RESERVATION_GRACE_DAYS}`);
+  console.log('');
+
+  candidates.forEach((post) => {
+    const { officialExpiry, reservationCutoff } = getReservationWindow(post);
+
+    console.log([
+      `vk_post_id=${post.vk_post_id}`,
+      `publish_date=${formatPublishDate(post.publish_date)}`,
+      `official_expiry=${formatPublishDate(officialExpiry)}`,
+      `reservation_cutoff=${formatPublishDate(reservationCutoff)}`,
+      `old_reservations_checked_at=${formatPublishDate(post.reservations_checked_at)}`,
+    ].join(' | '));
+  });
+
+  console.log('');
+  console.log(`eligible_to_reopen: ${candidates.length}`);
+
+  if (DRY_RUN) {
+    console.log('DRY_RUN=true: reservations_checked_at was not changed');
+    return {
+      eligible: candidates.length,
+      updated: 0,
+    };
+  }
+
+  const result = reopenReservationsChecked(candidates.map((post) => post.vk_post_id));
+  console.log(`reopened: ${result.updated}`);
+
+  return {
+    eligible: candidates.length,
+    updated: result.updated,
+  };
 }
 
 function buildReservationRecord({ postId, comment, item, status }) {
@@ -2993,6 +3049,11 @@ async function main() {
     return;
   }
 
+  if (command === 'reopen-grace-reservations') {
+    reopenGraceReservations();
+    return;
+  }
+
   if (command === 'reimport-post') {
     const vkPostId = Number(commandArg);
 
@@ -3169,6 +3230,7 @@ module.exports = {
   isCommentWithinReservationWindow,
   shouldMarkReservationsChecked,
   shouldScanReservationsPost,
+  getGraceReopenCandidates,
   buildReservationTasksForComment,
   makeReservationIdentity,
   publicPostCopyIncludesOnly24Hours,
