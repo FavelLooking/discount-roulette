@@ -17,7 +17,15 @@ const {
   buildPhotoReservationCommentText,
   buildPhotoReservationCommentRequest,
   deliverReservationPhotoComment,
+  parseReservationItemNumbers,
   parseReservationItemNumber,
+  getReservationWindow,
+  isCommentWithinReservationWindow,
+  shouldMarkReservationsChecked,
+  shouldScanReservationsPost,
+  buildReservationTasksForComment,
+  makeReservationIdentity,
+  publicPostCopyIncludesOnly24Hours,
 } = require('../index');
 
 function makeItems(count = 8) {
@@ -363,4 +371,129 @@ test('reservation photo comment workflow does not call photos.getComments', () =
   const source = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
 
   assert.doesNotMatch(source, /vk[A-Za-z]*\(\s*['"]photos\.getComments['"]/);
+});
+
+test('reservation within first 24h is accepted', () => {
+  const publish = 1_000_000;
+  assert.equal(isCommentWithinReservationWindow({ date: publish + 12 * 60 * 60 }, { publish_date: publish }, 3), true);
+});
+
+test('reservation 49 minutes after official expiry is accepted', () => {
+  const publish = 1_000_000;
+  assert.equal(isCommentWithinReservationWindow({ date: publish + 24 * 60 * 60 + 49 * 60 }, { publish_date: publish }, 3), true);
+});
+
+test('reservation during day plus 2 is accepted', () => {
+  const publish = 1_000_000;
+  assert.equal(isCommentWithinReservationWindow({ date: publish + 48 * 60 * 60 }, { publish_date: publish }, 3), true);
+});
+
+test('reservation during day plus 3 is accepted', () => {
+  const publish = 1_000_000;
+  assert.equal(isCommentWithinReservationWindow({ date: publish + 72 * 60 * 60 }, { publish_date: publish }, 3), true);
+});
+
+test('reservation after 96h cutoff is ignored', () => {
+  const publish = 1_000_000;
+  assert.equal(isCommentWithinReservationWindow({ date: publish + 96 * 60 * 60 + 1 }, { publish_date: publish }, 3), false);
+});
+
+test('same post is scanned repeatedly while grace remains open', () => {
+  const publish = 1_000_000;
+  const post = { publish_date: publish, reservations_checked_at: null };
+
+  assert.equal(shouldScanReservationsPost(post, publish + 25 * 60 * 60, 3), true);
+  assert.equal(shouldScanReservationsPost(post, publish + 50 * 60 * 60, 3), true);
+});
+
+test('reservations_checked_at is not set after first scan', () => {
+  const publish = 1_000_000;
+  const post = { publish_date: publish };
+
+  assert.equal(shouldMarkReservationsChecked(post, publish + 25 * 60 * 60, 3), false);
+});
+
+test('reservations_checked_at is set after final grace-window scan', () => {
+  const publish = 1_000_000;
+  const post = { publish_date: publish };
+
+  assert.equal(shouldMarkReservationsChecked(post, publish + 96 * 60 * 60, 3), true);
+});
+
+test('one wall comment with two reservations creates two item tasks', () => {
+  const items = new Map([
+    [1, { item_number: 1 }],
+    [4, { item_number: 4 }],
+  ]);
+  const tasks = buildReservationTasksForComment({ text: '1 бронь и 4 бронь' }, items);
+
+  assert.deepEqual(tasks.map((task) => task.itemNumber), [1, 4]);
+});
+
+test('"1 и 4 бронь" creates two reservations', () => {
+  assert.deepEqual(parseReservationItemNumbers('1 и 4 бронь'), [1, 4]);
+});
+
+test('duplicate item numbers in same comment are deduplicated', () => {
+  assert.deepEqual(parseReservationItemNumbers('1 бронь и 1 бронь, 4 бронь'), [1, 4]);
+});
+
+test('multi-item reservations can coexist under same wall comment id', () => {
+  assert.notEqual(
+    makeReservationIdentity(136586, 555, 1),
+    makeReservationIdentity(136586, 555, 4),
+  );
+});
+
+test('each item has its own photo-comment delivery state', () => {
+  const first = buildReservationRecord({
+    postId: 136586,
+    comment: { id: 555, from_id: 10, userName: 'Иван Иванов', text: '1 и 4 бронь' },
+    item: { item_number: 1, photo_attachment: 'photo-57561517_1', discount_price: 435 },
+    status: 'confirmed',
+  });
+  const second = buildReservationRecord({
+    postId: 136586,
+    comment: { id: 555, from_id: 10, userName: 'Иван Иванов', text: '1 и 4 бронь' },
+    item: { item_number: 4, photo_attachment: 'photo-57561517_4', discount_price: 585 },
+    status: 'confirmed',
+  });
+
+  assert.equal(first.photoCommentStatus, 'pending');
+  assert.equal(second.photoCommentStatus, 'pending');
+  assert.notEqual(first.photoAttachment, second.photoAttachment);
+});
+
+test('existing single-item historical reservations remain valid', () => {
+  assert.equal(makeReservationIdentity(136586, 555, 1), '136586:555:1');
+});
+
+test('golden sector persisted discount still used for late grace reservation', () => {
+  const text = buildPhotoReservationCommentText({
+    displayName: 'Иван Иванов',
+    discountPrice: 650,
+  });
+
+  assert.equal(text, 'Иван Иванов — бронь 650 ₽');
+});
+
+test('no 15-minute polling is restored', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+
+  assert.doesNotMatch(source, /15\s*\*\s*60\s*\*\s*1000/);
+  assert.doesNotMatch(source, /setInterval/);
+});
+
+test('public post text remains unchanged at 24 hours', () => {
+  const text = buildPostText(makeItems(8), { variant: 'normal', discountPercent: 25 });
+
+  assert.equal(publicPostCopyIncludesOnly24Hours(text), true);
+});
+
+test('reservation window is publish date through 96 hours with three grace days', () => {
+  const publish = 1_000_000;
+  const window = getReservationWindow({ publish_date: publish }, 3);
+
+  assert.equal(window.officialExpiry, publish + 24 * 60 * 60);
+  assert.equal(window.reservationCutoff, publish + 96 * 60 * 60);
 });

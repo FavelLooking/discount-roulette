@@ -78,8 +78,13 @@ function openDb() {
       photo_comment_guid TEXT
     );
 
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_post_comment
+    DROP INDEX IF EXISTS idx_reservations_post_comment;
+
+    CREATE INDEX IF NOT EXISTS idx_reservations_post_comment_lookup
       ON reservations(vk_post_id, comment_id);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_post_comment_item
+      ON reservations(vk_post_id, comment_id, item_number);
 
     CREATE INDEX IF NOT EXISTS idx_reservations_vk_post_id
       ON reservations(vk_post_id);
@@ -1309,8 +1314,72 @@ function getReservationByCommentId(vkPostId, commentId) {
   `).get(vkPostId, commentId);
 }
 
+function getReservationByCommentItem(vkPostId, commentId, itemNumber) {
+  if (itemNumber === null || itemNumber === undefined) {
+    return db.prepare(`
+      SELECT
+        id,
+        vk_post_id,
+        comment_id,
+        user_id,
+        user_name,
+        display_name,
+        item_number,
+        photo_attachment,
+        discount_price,
+        status,
+        raw_comment,
+        created_at,
+        fixed_at,
+        reply_sent_at,
+        photo_comment_status,
+        photo_comment_id,
+        photo_comment_sent_at,
+        photo_comment_last_error,
+        photo_comment_guid
+      FROM reservations
+      WHERE vk_post_id = ?
+        AND comment_id = ?
+        AND item_number IS NULL
+      LIMIT 1
+    `).get(vkPostId, commentId);
+  }
+
+  return db.prepare(`
+    SELECT
+      id,
+      vk_post_id,
+      comment_id,
+      user_id,
+      user_name,
+      display_name,
+      item_number,
+      photo_attachment,
+      discount_price,
+      status,
+      raw_comment,
+      created_at,
+      fixed_at,
+      reply_sent_at,
+      photo_comment_status,
+      photo_comment_id,
+      photo_comment_sent_at,
+      photo_comment_last_error,
+      photo_comment_guid
+    FROM reservations
+    WHERE vk_post_id = ?
+      AND comment_id = ?
+      AND item_number = ?
+    LIMIT 1
+  `).get(vkPostId, commentId, itemNumber);
+}
+
 function saveReservation(reservation) {
-  const existing = getReservationByCommentId(reservation.vkPostId, reservation.commentId);
+  const existing = getReservationByCommentItem(
+    reservation.vkPostId,
+    reservation.commentId,
+    reservation.itemNumber,
+  );
 
   if (existing) {
     return {
@@ -1339,7 +1408,7 @@ function saveReservation(reservation) {
       photo_comment_sent_at,
       photo_comment_last_error,
       photo_comment_guid
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     reservation.vkPostId,
     reservation.commentId,
@@ -1368,7 +1437,7 @@ function saveReservation(reservation) {
 }
 
 function updateReservationResolved(reservation) {
-  db.prepare(`
+  const sql = reservation.id ? `
     UPDATE reservations
     SET
       item_number = ?,
@@ -1380,8 +1449,31 @@ function updateReservationResolved(reservation) {
       user_name = ?,
       display_name = ?,
       photo_comment_status = COALESCE(photo_comment_status, 'pending')
-    WHERE vk_post_id = ? AND comment_id = ?
-  `).run(
+    WHERE id = ?
+  ` : `
+    UPDATE reservations
+    SET
+      item_number = ?,
+      photo_attachment = ?,
+      discount_price = ?,
+      status = 'confirmed',
+      raw_comment = ?,
+      fixed_at = ?,
+      user_name = ?,
+      display_name = ?,
+      photo_comment_status = COALESCE(photo_comment_status, 'pending')
+    WHERE vk_post_id = ? AND comment_id = ? AND item_number = ?
+  `;
+  const params = reservation.id ? [
+    reservation.itemNumber,
+    reservation.photoAttachment,
+    reservation.discountPrice,
+    reservation.rawComment,
+    reservation.fixedAt,
+    reservation.userName,
+    reservation.displayName,
+    reservation.id,
+  ] : [
     reservation.itemNumber,
     reservation.photoAttachment,
     reservation.discountPrice,
@@ -1391,7 +1483,10 @@ function updateReservationResolved(reservation) {
     reservation.displayName,
     reservation.vkPostId,
     reservation.commentId,
-  );
+    reservation.itemNumber,
+  ];
+
+  db.prepare(sql).run(...params);
 }
 
 function updateReservationUnresolvedComment({ vkPostId, commentId, rawComment, replySentAt }) {
@@ -1573,6 +1668,7 @@ module.exports = {
   resetTestPosts,
   getUsedItemsSummary,
   getReservationByCommentId,
+  getReservationByCommentItem,
   saveReservation,
   updateReservationResolved,
   updateReservationUnresolvedComment,

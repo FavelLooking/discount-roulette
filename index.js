@@ -32,6 +32,7 @@ const {
   resetTestPosts,
   getUsedItemsSummary,
   getReservationByCommentId,
+  getReservationByCommentItem,
   saveReservation,
   updateReservationResolved,
   updateReservationUnresolvedComment,
@@ -64,6 +65,7 @@ const USER_TOKEN = process.env.VK_USER_TOKEN;
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 const SKIP_UNRESOLVED_REPLIES = process.env.SKIP_UNRESOLVED_REPLIES === 'true';
 const PHOTO_COMMENT_BACKFILL_SINCE = process.env.PHOTO_COMMENT_BACKFILL_SINCE;
+const RESERVATION_GRACE_DAYS = Number(process.env.RESERVATION_GRACE_DAYS || 3);
 const PUBLISH_DELAY_MINUTES = Number(process.env.PUBLISH_DELAY_MINUTES || 130);
 const ROULETTE_CARD_ATTACHMENT = process.env.VK_ROULETTE_CARD_ATTACHMENT || config.rouletteCardAttachment || '';
 const ROULETTE_GOLD_CARD_ATTACHMENT = process.env.VK_ROULETTE_GOLD_CARD_ATTACHMENT || config.rouletteGoldCardAttachment || '';
@@ -736,41 +738,84 @@ async function fixRecentReservations() {
   await fixReservations();
 }
 
-function parseReservationItemNumber(text = '') {
+function parseReservationItemNumbers(text = '') {
   const normalized = String(text)
     .toLowerCase()
     .replace(/[^\p{L}\d]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (/^[1-9]$/.test(normalized)) {
-    return Number(normalized);
+  if (/^[1-8]$/.test(normalized)) {
+    return [Number(normalized)];
   }
 
-  const patterns = [
-    /(?:^|\s)(?:бронь|лот|номер)\s+([1-9])(?:\s|$)/u,
-    /(?:^|\s)([1-9])\s+(?:бронь|лот|номер)(?:\s|$)/u,
-  ];
+  const hasExplicitReservationIntent = /(?:^|\s)(?:бронь|лот|номер)(?:\s|$)/u.test(normalized);
 
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-
-    if (match) {
-      return Number(match[1]);
-    }
+  if (!hasExplicitReservationIntent) {
+    return [];
   }
 
-  return null;
+  return [...new Set((normalized.match(/\b[1-8]\b/gu) || []).map(Number))];
+}
+
+function parseReservationItemNumber(text = '') {
+  const [itemNumber = null] = parseReservationItemNumbers(text);
+
+  return itemNumber;
+}
+
+function hasReservationIntent(text = '') {
+  const normalized = String(text).toLowerCase();
+
+  return ['бронь', 'заберу', 'отложите', 'мне', 'беру'].some((keyword) => normalized.includes(keyword));
 }
 
 function looksLikeReservationComment(text = '') {
-  const normalized = String(text).toLowerCase();
-  const keywords = ['бронь', 'заберу', 'отложите', 'мне', 'беру'];
-
-  return parseReservationItemNumber(text) !== null
-    || keywords.some((keyword) => normalized.includes(keyword));
+  return parseReservationItemNumbers(text).length > 0 || hasReservationIntent(text);
 }
 
+function getReservationWindow(post, graceDays = RESERVATION_GRACE_DAYS) {
+  const publishDate = Number(post.publish_date || post.date || 0);
+  const officialExpiry = publishDate + 24 * 60 * 60;
+  const reservationCutoff = officialExpiry + Math.max(0, Number(graceDays || 0)) * 24 * 60 * 60;
+
+  return {
+    publishDate,
+    officialExpiry,
+    reservationCutoff,
+  };
+}
+
+function isCommentWithinReservationWindow(comment, post, graceDays = RESERVATION_GRACE_DAYS) {
+  return Number(comment.date || 0) <= getReservationWindow(post, graceDays).reservationCutoff;
+}
+
+function shouldMarkReservationsChecked(post, now = Math.floor(Date.now() / 1000), graceDays = RESERVATION_GRACE_DAYS) {
+  return now >= getReservationWindow(post, graceDays).reservationCutoff;
+}
+
+function shouldScanReservationsPost(post, now = Math.floor(Date.now() / 1000), graceDays = RESERVATION_GRACE_DAYS) {
+  return Number(post.reservations_checked_at || 0) === 0
+    && now >= getReservationWindow(post, graceDays).officialExpiry;
+}
+
+function buildReservationTasksForComment(comment, itemsByNumber) {
+  return parseReservationItemNumbers(comment.text)
+    .map((itemNumber) => ({
+      itemNumber,
+      item: itemsByNumber.get(itemNumber) || null,
+    }));
+}
+
+function makeReservationIdentity(vkPostId, commentId, itemNumber) {
+  return `${vkPostId}:${commentId}:${itemNumber ?? 'unresolved'}`;
+}
+
+function publicPostCopyIncludesOnly24Hours(text) {
+  return String(text || '').includes('Актуально 24 часа')
+    && !String(text || '').includes('96')
+    && !String(text || '').includes('3 дня');
+}
 function getUserNames(comment, profilesById, groupsById) {
   if (comment.from_id > 0) {
     const profile = profilesById.get(comment.from_id) || {};
@@ -1253,7 +1298,9 @@ async function deliverReservationPhotoComment(reservation, options = {}) {
 }
 
 async function fixReservations(postsOverride = null) {
-  const posts = Array.isArray(postsOverride) ? postsOverride : listPostsForReservationFix();
+  const now = Math.floor(Date.now() / 1000);
+  const sourcePosts = Array.isArray(postsOverride) ? postsOverride : listPostsForReservationFix();
+  const posts = sourcePosts.filter((post) => shouldScanReservationsPost(post, now));
 
   if (posts.length === 0) {
     console.log('No reservation checks due');
@@ -1262,9 +1309,10 @@ async function fixReservations(postsOverride = null) {
 
   console.log(`FIX RESERVATIONS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
   console.log(`posts: ${posts.length}`);
-  console.log('Reservation mode: one-shot due posts only');
+  console.log(`RESERVATION_GRACE_DAYS: ${RESERVATION_GRACE_DAYS}`);
+  console.log('Reservation mode: repeated daily scan until grace cutoff');
   console.log('Photo comment delivery: SQLite-idempotent photos.createComment via VK_USER_TOKEN');
-  console.log('No wall.createComment, no photos.getComments, no repeated polling');
+  console.log('No wall.createComment, no photos.getComments, no 15-minute polling');
 
   if (SKIP_UNRESOLVED_REPLIES) {
     console.log('SKIP_UNRESOLVED_REPLIES=true: unresolved replies disabled');
@@ -1276,9 +1324,11 @@ async function fixReservations(postsOverride = null) {
     confirmed: 0,
     unresolved: 0,
     skippedDuplicates: 0,
+    lateAfterGraceSkipped: 0,
   };
 
   for (const post of posts) {
+    const window = getReservationWindow(post);
     const items = getPostItems(post.vk_post_id);
     const itemsByNumber = new Map(items.map((item) => [Number(item.item_number), item]));
     const foundItemNumbers = new Set();
@@ -1297,6 +1347,8 @@ async function fixReservations(postsOverride = null) {
     console.log(`POST ${post.vk_post_id}`);
     console.log(`status: ${post.status}`);
     console.log(`publish_date_text: ${post.publish_date_text}`);
+    console.log(`official_expiry: ${formatPublishDate(window.officialExpiry)}`);
+    console.log(`reservation_cutoff: ${formatPublishDate(window.reservationCutoff)}`);
     console.log(`comments: ${comments.length}`);
     stats.commentsChecked += comments.length;
 
@@ -1305,87 +1357,35 @@ async function fixReservations(postsOverride = null) {
         continue;
       }
 
-      const itemNumber = parseReservationItemNumber(comment.text);
-      const isReservationLike = looksLikeReservationComment(comment.text);
-
-      if (!itemNumber && !isReservationLike) {
+      if (Number(comment.date || 0) > window.reservationCutoff) {
+        stats.lateAfterGraceSkipped += 1;
         continue;
       }
 
-      const existingReservation = getReservationByCommentId(post.vk_post_id, comment.id);
+      const tasks = buildReservationTasksForComment(comment, itemsByNumber);
+      const isReservationLike = looksLikeReservationComment(comment.text);
 
-      if (existingReservation) {
-        if (existingReservation.status === 'confirmed') {
-          console.log(`Reservation already confirmed for comment ${comment.id}, skipped`);
+      if (tasks.length === 0 && !isReservationLike) {
+        continue;
+      }
+
+      if (tasks.length === 0) {
+        const existingUnresolved = getReservationByCommentItem(post.vk_post_id, comment.id, null)
+          || getReservationByCommentId(post.vk_post_id, comment.id);
+
+        if (existingUnresolved) {
+          if (!DRY_RUN) {
+            updateReservationUnresolvedComment({
+              vkPostId: post.vk_post_id,
+              commentId: comment.id,
+              rawComment: comment.text || '',
+              replySentAt: null,
+            });
+          }
           stats.skippedDuplicates += 1;
           continue;
         }
 
-        if (existingReservation.status === 'unresolved') {
-          console.log('existing unresolved reservation, rechecking comment');
-
-          if (!itemNumber) {
-            if (!DRY_RUN) {
-              updateReservationUnresolvedComment({
-                vkPostId: post.vk_post_id,
-                commentId: comment.id,
-                rawComment: comment.text || '',
-                replySentAt: null,
-              });
-            }
-            stats.unresolved += 1;
-            continue;
-          }
-
-          const item = itemsByNumber.get(itemNumber);
-
-          if (!item) {
-            if (!DRY_RUN) {
-              updateReservationUnresolvedComment({
-                vkPostId: post.vk_post_id,
-                commentId: comment.id,
-                rawComment: comment.text || '',
-                replySentAt: null,
-              });
-            }
-            stats.unresolved += 1;
-            continue;
-          }
-
-          console.log(`resolved unresolved reservation: item_number ${itemNumber}`);
-
-          const reservation = buildReservationRecord({
-            postId: post.vk_post_id,
-            comment,
-            item,
-            status: 'confirmed',
-          });
-
-          if (!DRY_RUN) {
-            updateReservationResolved(reservation);
-          }
-
-          const deliveryReservation = {
-            ...reservation,
-            id: existingReservation.id,
-            photoOwnerId: item.photo_owner_id,
-            photoId: item.photo_id,
-          };
-
-          await finalizeConfirmedReservation({
-            reservation,
-            item,
-            mode: DRY_RUN ? 'Would resolve unresolved reservation' : 'Resolved unresolved reservation',
-          });
-          await deliverReservationPhotoComment(deliveryReservation);
-          stats.confirmed += 1;
-          continue;
-        }
-      }
-
-      const item = itemNumber ? itemsByNumber.get(itemNumber) : null;
-
-      if (!item) {
         const reservation = buildReservationRecord({
           postId: post.vk_post_id,
           comment,
@@ -1404,41 +1404,98 @@ async function fixReservations(postsOverride = null) {
         continue;
       }
 
-      if (foundItemNumbers.has(itemNumber)) {
-        console.warn(`Warning: duplicate reservation for item ${itemNumber}`);
+      for (const task of tasks) {
+        const { itemNumber, item } = task;
+        const existingReservation = getReservationByCommentItem(post.vk_post_id, comment.id, itemNumber);
+
+        if (existingReservation) {
+          if (existingReservation.status === 'confirmed') {
+            console.log(`Reservation already confirmed for comment ${comment.id}, item ${itemNumber}, skipped`);
+            stats.skippedDuplicates += 1;
+            continue;
+          }
+        }
+
+        if (!item) {
+          const existingUnresolved = getReservationByCommentItem(post.vk_post_id, comment.id, null);
+
+          if (!existingUnresolved) {
+            const reservation = buildReservationRecord({
+              postId: post.vk_post_id,
+              comment,
+              item: null,
+              status: 'unresolved',
+            });
+
+            printReservationAction(DRY_RUN ? 'Would save unresolved reservation' : 'Unresolved reservation', reservation, null);
+
+            if (!DRY_RUN) {
+              saveReservation(reservation);
+            }
+          } else {
+            stats.skippedDuplicates += 1;
+          }
+
+          stats.unresolved += 1;
+          continue;
+        }
+
+        if (foundItemNumbers.has(itemNumber)) {
+          console.warn(`Warning: duplicate reservation for item ${itemNumber}`);
+        }
+
+        foundItemNumbers.add(itemNumber);
+
+        const unresolvedReservation = getReservationByCommentItem(post.vk_post_id, comment.id, null);
+        const reservation = buildReservationRecord({
+          postId: post.vk_post_id,
+          comment,
+          item,
+          status: 'confirmed',
+        });
+
+        let savedReservation = null;
+        let deliveryReservationId = null;
+
+        if (!DRY_RUN) {
+          if (existingReservation) {
+            reservation.id = existingReservation.id;
+            updateReservationResolved(reservation);
+            deliveryReservationId = existingReservation.id;
+          } else if (unresolvedReservation) {
+            reservation.id = unresolvedReservation.id;
+            updateReservationResolved(reservation);
+            deliveryReservationId = unresolvedReservation.id;
+          } else {
+            savedReservation = saveReservation(reservation);
+            deliveryReservationId = savedReservation?.id;
+          }
+        }
+
+        await finalizeConfirmedReservation({
+          reservation,
+          item,
+          mode: DRY_RUN ? 'Would save confirmed reservation' : 'Confirmed reservation',
+        });
+        await deliverReservationPhotoComment({
+          ...reservation,
+          id: deliveryReservationId,
+          photoOwnerId: item.photo_owner_id,
+          photoId: item.photo_id,
+        });
+        stats.confirmed += 1;
       }
-
-      foundItemNumbers.add(itemNumber);
-
-      const reservation = buildReservationRecord({
-        postId: post.vk_post_id,
-        comment,
-        item,
-        status: 'confirmed',
-      });
-
-      let savedReservation = null;
-      if (!DRY_RUN) {
-        savedReservation = saveReservation(reservation);
-      }
-
-      await finalizeConfirmedReservation({
-        reservation,
-        item,
-        mode: DRY_RUN ? 'Would save confirmed reservation' : 'Confirmed reservation',
-      });
-      await deliverReservationPhotoComment({
-        ...reservation,
-        id: savedReservation?.id,
-        photoOwnerId: item.photo_owner_id,
-        photoId: item.photo_id,
-      });
-      stats.confirmed += 1;
     }
 
+    console.log(`late_after_grace_skipped: ${stats.lateAfterGraceSkipped}`);
+
     if (scanCompleted && !DRY_RUN) {
-      markReservationsChecked(post.vk_post_id);
-      console.log(`reservations_checked_at set for post ${post.vk_post_id}`);
+      if (shouldMarkReservationsChecked(post, now)) {
+        markReservationsChecked(post.vk_post_id);
+        console.log(`reservations_checked_at set for post ${post.vk_post_id}`);
+      } else {
+        console.log(`reservations_checked_at left NULL for post ${post.vk_post_id}; grace window is still open`);
+      }
     }
 
     await waitToAvoidVkRateLimit(2000);
@@ -1451,8 +1508,8 @@ async function fixReservations(postsOverride = null) {
   console.log(`confirmed: ${stats.confirmed}`);
   console.log(`unresolved: ${stats.unresolved}`);
   console.log(`skipped_duplicates: ${stats.skippedDuplicates}`);
+  console.log(`late_after_grace_skipped: ${stats.lateAfterGraceSkipped}`);
 }
-
 function isValidPhotoAttachment(attachment) {
   return /^photo-?\d+_\d+$/.test(String(attachment || ''));
 }
@@ -3106,7 +3163,15 @@ module.exports = {
   buildScheduledPostPlans,
   getAllAvailableItems,
   publishDelayedPost,
+  parseReservationItemNumbers,
   parseReservationItemNumber,
+  getReservationWindow,
+  isCommentWithinReservationWindow,
+  shouldMarkReservationsChecked,
+  shouldScanReservationsPost,
+  buildReservationTasksForComment,
+  makeReservationIdentity,
+  publicPostCopyIncludesOnly24Hours,
   fixReservations,
   syncRecentRoulettePosts,
   fixRecentReservations,
