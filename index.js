@@ -1,4 +1,5 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const opentype = require('opentype.js');
@@ -35,6 +36,12 @@ const {
   updateReservationResolved,
   updateReservationUnresolvedComment,
   listReservations,
+  listPendingPhotoCommentReservations,
+  ensureReservationPhotoCommentGuid,
+  markReservationPhotoCommentSent,
+  markReservationPhotoCommentFailed,
+  listBackfillablePhotoCommentReservations,
+  backfillPhotoCommentPending,
   recordVkApiUsage,
   getApiUsageRows,
   getApiUsageTotal,
@@ -53,8 +60,10 @@ const VK_API_VERSION = process.env.VK_API_VERSION || '5.199';
 const GROUP_ID = Number(process.env.VK_GROUP_ID);
 const SERVICE_TOKEN = process.env.VK_SERVICE_TOKEN;
 const GROUP_TOKEN = process.env.VK_GROUP_TOKEN;
+const USER_TOKEN = process.env.VK_USER_TOKEN;
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 const SKIP_UNRESOLVED_REPLIES = process.env.SKIP_UNRESOLVED_REPLIES === 'true';
+const PHOTO_COMMENT_BACKFILL_SINCE = process.env.PHOTO_COMMENT_BACKFILL_SINCE;
 const PUBLISH_DELAY_MINUTES = Number(process.env.PUBLISH_DELAY_MINUTES || 130);
 const ROULETTE_CARD_ATTACHMENT = process.env.VK_ROULETTE_CARD_ATTACHMENT || config.rouletteCardAttachment || '';
 const ROULETTE_GOLD_CARD_ATTACHMENT = process.env.VK_ROULETTE_GOLD_CARD_ATTACHMENT || config.rouletteGoldCardAttachment || '';
@@ -851,6 +860,9 @@ function printReservationsList() {
       `display_name=${reservation.display_name || ''}`,
       `discount_price=${reservation.discount_price || ''}`,
       `status=${reservation.status}`,
+      `photo_comment_status=${reservation.photo_comment_status || ''}`,
+      `photo_comment_id=${reservation.photo_comment_id || ''}`,
+      `photo_comment_last_error=${reservation.photo_comment_last_error || ''}`,
       `raw_comment=${reservation.raw_comment || ''}`,
     ].join(' | '));
   });
@@ -997,6 +1009,73 @@ function importQueueStateFromFile(inputPath) {
   return summary;
 }
 
+async function syncPhotoComments() {
+  const reservations = listPendingPhotoCommentReservations();
+
+  console.log(`SYNC PHOTO COMMENTS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
+  console.log(`pending reservations: ${reservations.length}`);
+
+  if (reservations.length === 0) {
+    return;
+  }
+
+  for (const reservation of reservations) {
+    await deliverReservationPhotoComment(reservation);
+  }
+}
+
+function parseBackfillSince(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (/^\d+$/.test(String(value))) {
+    return Number(value);
+  }
+
+  const timestamp = Date.parse(value);
+
+  if (Number.isNaN(timestamp)) {
+    throw new Error('PHOTO_COMMENT_BACKFILL_SINCE must be a unix timestamp or parseable date');
+  }
+
+  return Math.floor(timestamp / 1000);
+}
+
+function backfillPhotoComments() {
+  const sinceTimestamp = parseBackfillSince(PHOTO_COMMENT_BACKFILL_SINCE);
+
+  if (!sinceTimestamp) {
+    console.log('PHOTO_COMMENT_BACKFILL_SINCE is absent. Historical reservations were not backfilled.');
+    return;
+  }
+
+  const reservations = listBackfillablePhotoCommentReservations(sinceTimestamp);
+
+  console.log(`PHOTO COMMENT BACKFILL ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
+  console.log(`since: ${sinceTimestamp}`);
+  console.log(`reservations: ${reservations.length}`);
+  reservations.forEach((reservation) => {
+    console.log([
+      `reservation id=${reservation.id}`,
+      `vk_post_id=${reservation.vk_post_id}`,
+      `comment_id=${reservation.comment_id}`,
+      `display_name=${reservation.display_name || reservation.user_name || ''}`,
+      `item=${reservation.item_number}`,
+      `photo=${reservation.photo_attachment}`,
+      `price=${reservation.discount_price}`,
+    ].join(' | '));
+  });
+
+  if (DRY_RUN) {
+    console.log('DRY_RUN=true: no historical reservations were changed');
+    return;
+  }
+
+  const result = backfillPhotoCommentPending(sinceTimestamp);
+  console.log(`Backfilled reservations: ${result.updated}`);
+}
+
 function buildReservationRecord({ postId, comment, item, status }) {
   const now = Math.floor(Date.now() / 1000);
 
@@ -1015,6 +1094,11 @@ function buildReservationRecord({ postId, comment, item, status }) {
     createdAt: now,
     fixedAt: status === 'confirmed' ? now : null,
     replySentAt: status === 'unresolved' ? null : null,
+    photoCommentStatus: status === 'confirmed' ? 'pending' : null,
+    photoCommentId: null,
+    photoCommentSentAt: null,
+    photoCommentLastError: null,
+    photoCommentGuid: null,
   };
 }
 
@@ -1030,12 +1114,142 @@ function printReservationAction(action, reservation, item) {
   console.log(`status: ${reservation.status}`);
 
   if (item) {
-    console.log(`photo_comment: ${reservation.displayName || reservation.userName} — бронь ${item.discount_price} ₽`);
+    console.log(`photo_comment: ${buildPhotoReservationCommentText({
+      ...reservation,
+      discountPrice: item.discount_price,
+    })}`);
   }
+}
+
+function buildPhotoReservationCommentText(reservation) {
+  const displayName = reservation.displayName
+    || reservation.display_name
+    || reservation.userName
+    || reservation.user_name
+    || `id${reservation.userId || reservation.user_id || ''}`.trim()
+    || 'Покупатель';
+  const discountPrice = reservation.discountPrice ?? reservation.discount_price;
+
+  return `${displayName} — бронь ${discountPrice} ₽`;
+}
+
+function buildPhotoReservationCommentRequest(reservation, guid) {
+  const photoOwnerId = reservation.photoOwnerId ?? reservation.photo_owner_id;
+  const photoId = reservation.photoId ?? reservation.photo_id;
+
+  if (!photoOwnerId || !photoId) {
+    throw new Error('Photo comment target is missing photo owner/id');
+  }
+
+  return {
+    method: 'photos.createComment',
+    tokenRole: 'user',
+    params: {
+      owner_id: photoOwnerId,
+      photo_id: photoId,
+      message: buildPhotoReservationCommentText(reservation),
+      from_group: Math.abs(GROUP_ID),
+      guid,
+    },
+  };
 }
 
 async function finalizeConfirmedReservation({ reservation, item, mode }) {
   printReservationAction(mode, reservation, item);
+}
+
+async function deliverReservationPhotoComment(reservation, options = {}) {
+  const dryRun = options.dryRun ?? DRY_RUN;
+  const userToken = options.userToken ?? USER_TOKEN;
+  const createComment = options.createComment || ((params) => vkPhotoComment('photos.createComment', params));
+  const markSent = options.markSent || markReservationPhotoCommentSent;
+  const markFailed = options.markFailed || markReservationPhotoCommentFailed;
+  const ensureGuid = options.ensureGuid || ensureReservationPhotoCommentGuid;
+  const waitAfterSend = options.waitAfterSend !== false;
+
+  if (reservation.photo_comment_status === 'sent' || reservation.photoCommentStatus === 'sent') {
+    console.log(`Photo comment already sent for reservation ${reservation.id}, skipped`);
+    return {
+      status: 'skipped_sent',
+    };
+  }
+
+  const fallbackGuid = reservation.photo_comment_guid
+    || reservation.photoCommentGuid
+    || crypto.randomUUID();
+  const guidRow = dryRun || !reservation.id
+    ? { photo_comment_guid: fallbackGuid }
+    : ensureGuid(reservation.id, fallbackGuid);
+  const guid = guidRow.photo_comment_guid || fallbackGuid;
+  const request = buildPhotoReservationCommentRequest(reservation, guid);
+
+  if (dryRun) {
+    console.log('PHOTO COMMENT DRY_RUN:');
+    console.log(`reservation id: ${reservation.id || ''}`);
+    console.log(`wall post id: ${reservation.vk_post_id || reservation.vkPostId}`);
+    console.log(`wall comment id: ${reservation.comment_id || reservation.commentId}`);
+    console.log(`user/display name: ${reservation.display_name || reservation.displayName || reservation.user_name || reservation.userName || ''}`);
+    console.log(`item number: ${reservation.item_number || reservation.itemNumber || ''}`);
+    console.log(`target photo attachment: ${reservation.photo_attachment || reservation.photoAttachment || ''}`);
+    console.log(`discount price: ${reservation.discount_price ?? reservation.discountPrice}`);
+    console.log(`exact photo comment text: ${request.params.message}`);
+    return {
+      status: 'dry_run',
+      request,
+    };
+  }
+
+  if (!userToken) {
+    const message = 'PHOTO COMMENT PENDING: USER TOKEN REQUIRED / EXPIRED OR INVALID';
+    console.warn(message);
+    if (reservation.id) {
+      markFailed(reservation.id, message);
+    }
+    return {
+      status: 'failed_retryable',
+      error: message,
+    };
+  }
+
+  try {
+    const response = await createComment(request.params);
+    const commentId = typeof response === 'number'
+      ? response
+      : Number(response?.comment_id || response?.id || response);
+
+    if (!commentId) {
+      throw new Error('photos.createComment did not return comment_id');
+    }
+
+    if (reservation.id) {
+      markSent(reservation.id, commentId);
+    }
+
+    console.log(`Photo comment sent: ${commentId}`);
+    if (waitAfterSend) {
+      await waitToAvoidVkRateLimit(2000);
+    }
+
+    return {
+      status: 'sent',
+      commentId,
+    };
+  } catch (error) {
+    const isTokenError = error.vkCode === 5 || /token|auth|authorization|access/i.test(error.message || '');
+    const message = isTokenError
+      ? 'PHOTO COMMENT PENDING: USER TOKEN REQUIRED / EXPIRED OR INVALID'
+      : `PHOTO COMMENT PENDING: ${error.message || error}`;
+
+    console.warn(message);
+    if (reservation.id) {
+      markFailed(reservation.id, message);
+    }
+
+    return {
+      status: 'failed_retryable',
+      error: message,
+    };
+  }
 }
 
 async function fixReservations(postsOverride = null) {
@@ -1049,7 +1263,8 @@ async function fixReservations(postsOverride = null) {
   console.log(`FIX RESERVATIONS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
   console.log(`posts: ${posts.length}`);
   console.log('Reservation mode: one-shot due posts only');
-  console.log('V1: no photos.createComment, no wall.createComment, no repeated polling');
+  console.log('Photo comment delivery: SQLite-idempotent photos.createComment via VK_USER_TOKEN');
+  console.log('No wall.createComment, no photos.getComments, no repeated polling');
 
   if (SKIP_UNRESOLVED_REPLIES) {
     console.log('SKIP_UNRESOLVED_REPLIES=true: unresolved replies disabled');
@@ -1150,11 +1365,19 @@ async function fixReservations(postsOverride = null) {
             updateReservationResolved(reservation);
           }
 
+          const deliveryReservation = {
+            ...reservation,
+            id: existingReservation.id,
+            photoOwnerId: item.photo_owner_id,
+            photoId: item.photo_id,
+          };
+
           await finalizeConfirmedReservation({
             reservation,
             item,
             mode: DRY_RUN ? 'Would resolve unresolved reservation' : 'Resolved unresolved reservation',
           });
+          await deliverReservationPhotoComment(deliveryReservation);
           stats.confirmed += 1;
           continue;
         }
@@ -1194,14 +1417,21 @@ async function fixReservations(postsOverride = null) {
         status: 'confirmed',
       });
 
+      let savedReservation = null;
       if (!DRY_RUN) {
-        saveReservation(reservation);
+        savedReservation = saveReservation(reservation);
       }
 
       await finalizeConfirmedReservation({
         reservation,
         item,
         mode: DRY_RUN ? 'Would save confirmed reservation' : 'Confirmed reservation',
+      });
+      await deliverReservationPhotoComment({
+        ...reservation,
+        id: savedReservation?.id,
+        photoOwnerId: item.photo_owner_id,
+        photoId: item.photo_id,
       });
       stats.confirmed += 1;
     }
@@ -1441,6 +1671,14 @@ async function vkReservation(method, params = {}) {
     operation: 'reservation',
     tokenType: 'service',
     missingTokenMessage: 'VK_SERVICE_TOKEN пустой',
+  });
+}
+
+async function vkPhotoComment(method, params = {}) {
+  return vk(method, params, USER_TOKEN, {
+    operation: 'reservation_photo_comment',
+    tokenType: 'user',
+    missingTokenMessage: 'VK_USER_TOKEN пустой',
   });
 }
 
@@ -2688,6 +2926,16 @@ async function main() {
     return;
   }
 
+  if (command === 'sync-photo-comments') {
+    await syncPhotoComments();
+    return;
+  }
+
+  if (command === 'photo-comment-backfill') {
+    backfillPhotoComments();
+    return;
+  }
+
   if (command === 'reimport-post') {
     const vkPostId = Number(commandArg);
 
@@ -2850,6 +3098,10 @@ module.exports = {
   buildWallAttachments,
   buildProductFingerprint,
   buildDbItems,
+  buildReservationRecord,
+  buildPhotoReservationCommentText,
+  buildPhotoReservationCommentRequest,
+  deliverReservationPhotoComment,
   createPreviewImage,
   buildScheduledPostPlans,
   getAllAvailableItems,

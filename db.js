@@ -70,7 +70,12 @@ function openDb() {
       raw_comment TEXT,
       created_at INTEGER,
       fixed_at INTEGER,
-      reply_sent_at INTEGER
+      reply_sent_at INTEGER,
+      photo_comment_status TEXT,
+      photo_comment_id INTEGER,
+      photo_comment_sent_at INTEGER,
+      photo_comment_last_error TEXT,
+      photo_comment_guid TEXT
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_post_comment
@@ -124,6 +129,11 @@ function openDb() {
   const reservationColumns = db.prepare('PRAGMA table_info(reservations)').all();
   const hasReplySentAt = reservationColumns.some((column) => column.name === 'reply_sent_at');
   const hasDisplayName = reservationColumns.some((column) => column.name === 'display_name');
+  const hasPhotoCommentStatus = reservationColumns.some((column) => column.name === 'photo_comment_status');
+  const hasPhotoCommentId = reservationColumns.some((column) => column.name === 'photo_comment_id');
+  const hasPhotoCommentSentAt = reservationColumns.some((column) => column.name === 'photo_comment_sent_at');
+  const hasPhotoCommentLastError = reservationColumns.some((column) => column.name === 'photo_comment_last_error');
+  const hasPhotoCommentGuid = reservationColumns.some((column) => column.name === 'photo_comment_guid');
   const usedItemColumns = db.prepare('PRAGMA table_info(used_items)').all();
   const hasUsedItemState = usedItemColumns.some((column) => column.name === 'state');
 
@@ -191,6 +201,26 @@ function openDb() {
 
   if (!hasDisplayName) {
     db.exec('ALTER TABLE reservations ADD COLUMN display_name TEXT');
+  }
+
+  if (!hasPhotoCommentStatus) {
+    db.exec('ALTER TABLE reservations ADD COLUMN photo_comment_status TEXT');
+  }
+
+  if (!hasPhotoCommentId) {
+    db.exec('ALTER TABLE reservations ADD COLUMN photo_comment_id INTEGER');
+  }
+
+  if (!hasPhotoCommentSentAt) {
+    db.exec('ALTER TABLE reservations ADD COLUMN photo_comment_sent_at INTEGER');
+  }
+
+  if (!hasPhotoCommentLastError) {
+    db.exec('ALTER TABLE reservations ADD COLUMN photo_comment_last_error TEXT');
+  }
+
+  if (!hasPhotoCommentGuid) {
+    db.exec('ALTER TABLE reservations ADD COLUMN photo_comment_guid TEXT');
   }
 
   if (!hasUsedItemState) {
@@ -1268,7 +1298,12 @@ function getReservationByCommentId(vkPostId, commentId) {
       raw_comment,
       created_at,
       fixed_at,
-      reply_sent_at
+      reply_sent_at,
+      photo_comment_status,
+      photo_comment_id,
+      photo_comment_sent_at,
+      photo_comment_last_error,
+      photo_comment_guid
     FROM reservations
     WHERE vk_post_id = ? AND comment_id = ?
   `).get(vkPostId, commentId);
@@ -1284,7 +1319,7 @@ function saveReservation(reservation) {
     };
   }
 
-  db.prepare(`
+  const result = db.prepare(`
     INSERT INTO reservations (
       vk_post_id,
       comment_id,
@@ -1298,8 +1333,13 @@ function saveReservation(reservation) {
       raw_comment,
       created_at,
       fixed_at,
-      reply_sent_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      reply_sent_at,
+      photo_comment_status,
+      photo_comment_id,
+      photo_comment_sent_at,
+      photo_comment_last_error,
+      photo_comment_guid
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     reservation.vkPostId,
     reservation.commentId,
@@ -1314,10 +1354,16 @@ function saveReservation(reservation) {
     reservation.createdAt,
     reservation.fixedAt,
     reservation.replySentAt,
+    reservation.photoCommentStatus || null,
+    reservation.photoCommentId || null,
+    reservation.photoCommentSentAt || null,
+    reservation.photoCommentLastError || null,
+    reservation.photoCommentGuid || null,
   );
 
   return {
     saved: true,
+    id: Number(result.lastInsertRowid || 0),
   };
 }
 
@@ -1330,7 +1376,10 @@ function updateReservationResolved(reservation) {
       discount_price = ?,
       status = 'confirmed',
       raw_comment = ?,
-      fixed_at = ?
+      fixed_at = ?,
+      user_name = ?,
+      display_name = ?,
+      photo_comment_status = COALESCE(photo_comment_status, 'pending')
     WHERE vk_post_id = ? AND comment_id = ?
   `).run(
     reservation.itemNumber,
@@ -1338,6 +1387,8 @@ function updateReservationResolved(reservation) {
     reservation.discountPrice,
     reservation.rawComment,
     reservation.fixedAt,
+    reservation.userName,
+    reservation.displayName,
     reservation.vkPostId,
     reservation.commentId,
   );
@@ -1362,11 +1413,136 @@ function listReservations(limit = 100) {
       display_name,
       discount_price,
       status,
-      raw_comment
+      raw_comment,
+      photo_comment_status,
+      photo_comment_id,
+      photo_comment_sent_at,
+      photo_comment_last_error,
+      photo_comment_guid
     FROM reservations
     ORDER BY id DESC
     LIMIT ?
   `).all(limit);
+}
+
+function listPendingPhotoCommentReservations(limit = 100) {
+  return db.prepare(`
+    SELECT
+      reservations.id,
+      reservations.vk_post_id,
+      reservations.comment_id,
+      reservations.user_id,
+      reservations.user_name,
+      reservations.display_name,
+      reservations.item_number,
+      reservations.photo_attachment,
+      reservations.discount_price,
+      reservations.status,
+      reservations.raw_comment,
+      reservations.created_at,
+      reservations.fixed_at,
+      reservations.photo_comment_status,
+      reservations.photo_comment_id,
+      reservations.photo_comment_sent_at,
+      reservations.photo_comment_last_error,
+      reservations.photo_comment_guid,
+      post_items.photo_owner_id,
+      post_items.photo_id
+    FROM reservations
+    JOIN post_items
+      ON post_items.vk_post_id = reservations.vk_post_id
+      AND post_items.item_number = reservations.item_number
+    WHERE reservations.status = 'confirmed'
+      AND reservations.photo_comment_status IN ('pending', 'failed_retryable')
+    ORDER BY reservations.id ASC
+    LIMIT ?
+  `).all(limit);
+}
+
+function ensureReservationPhotoCommentGuid(reservationId, guid) {
+  db.prepare(`
+    UPDATE reservations
+    SET photo_comment_guid = COALESCE(photo_comment_guid, ?)
+    WHERE id = ?
+  `).run(guid, reservationId);
+
+  return db.prepare(`
+    SELECT
+      id,
+      photo_comment_guid
+    FROM reservations
+    WHERE id = ?
+  `).get(reservationId);
+}
+
+function markReservationPhotoCommentSent(reservationId, commentId, sentAt = Math.floor(Date.now() / 1000)) {
+  db.prepare(`
+    UPDATE reservations
+    SET
+      photo_comment_status = 'sent',
+      photo_comment_id = ?,
+      photo_comment_sent_at = ?,
+      photo_comment_last_error = NULL
+    WHERE id = ?
+  `).run(commentId, sentAt, reservationId);
+}
+
+function markReservationPhotoCommentFailed(reservationId, errorMessage) {
+  db.prepare(`
+    UPDATE reservations
+    SET
+      photo_comment_status = 'failed_retryable',
+      photo_comment_last_error = ?
+    WHERE id = ?
+  `).run(String(errorMessage || '').slice(0, 1000), reservationId);
+}
+
+function listBackfillablePhotoCommentReservations(sinceTimestamp) {
+  return db.prepare(`
+    SELECT
+      id,
+      vk_post_id,
+      comment_id,
+      user_id,
+      user_name,
+      display_name,
+      item_number,
+      photo_attachment,
+      discount_price,
+      status,
+      raw_comment,
+      created_at,
+      fixed_at,
+      photo_comment_status
+    FROM reservations
+    WHERE status = 'confirmed'
+      AND photo_comment_status IS NULL
+      AND created_at >= ?
+    ORDER BY id ASC
+  `).all(sinceTimestamp);
+}
+
+function backfillPhotoCommentPending(sinceTimestamp) {
+  const reservations = listBackfillablePhotoCommentReservations(sinceTimestamp);
+  const transaction = db.transaction(() => {
+    const update = db.prepare(`
+      UPDATE reservations
+      SET photo_comment_status = 'pending'
+      WHERE id = ?
+        AND photo_comment_status IS NULL
+    `);
+
+    reservations.forEach((reservation) => {
+      update.run(reservation.id);
+    });
+  });
+
+  transaction();
+
+  return {
+    updated: reservations.length,
+    reservations,
+  };
 }
 
 module.exports = {
@@ -1401,6 +1577,12 @@ module.exports = {
   updateReservationResolved,
   updateReservationUnresolvedComment,
   listReservations,
+  listPendingPhotoCommentReservations,
+  ensureReservationPhotoCommentGuid,
+  markReservationPhotoCommentSent,
+  markReservationPhotoCommentFailed,
+  listBackfillablePhotoCommentReservations,
+  backfillPhotoCommentPending,
   recordVkApiUsage,
   getApiUsageRows,
   getApiUsageTotal,
