@@ -68,6 +68,8 @@ const DRY_RUN = process.env.DRY_RUN !== 'false';
 const SKIP_UNRESOLVED_REPLIES = process.env.SKIP_UNRESOLVED_REPLIES === 'true';
 const PHOTO_COMMENT_BACKFILL_SINCE = process.env.PHOTO_COMMENT_BACKFILL_SINCE;
 const RESERVATION_GRACE_DAYS = Number(process.env.RESERVATION_GRACE_DAYS || 3);
+const WALL_SYNC_PAGE_SIZE = Number(process.env.WALL_SYNC_PAGE_SIZE || 100);
+const WALL_SYNC_MAX_PAGES = Number(process.env.WALL_SYNC_MAX_PAGES || 10);
 const PUBLISH_DELAY_MINUTES = Number(process.env.PUBLISH_DELAY_MINUTES || 130);
 const ROULETTE_CARD_ATTACHMENT = process.env.VK_ROULETTE_CARD_ATTACHMENT || config.rouletteCardAttachment || '';
 const ROULETTE_GOLD_CARD_ATTACHMENT = process.env.VK_ROULETTE_GOLD_CARD_ATTACHMENT || config.rouletteGoldCardAttachment || '';
@@ -636,15 +638,54 @@ function isRoulettePost(post) {
   return String(post.text || '').includes('#CP_СкидочнаяРулетка');
 }
 
-async function getRecentWallPosts(limit = 3) {
+function getPublishedRouletteSyncHorizon(now = Math.floor(Date.now() / 1000), graceDays = RESERVATION_GRACE_DAYS) {
+  return now - (24 + Math.max(0, Number(graceDays || 0)) * 24) * 60 * 60;
+}
+
+function shouldContinueWallPagination(posts, horizonStart) {
+  if (!Array.isArray(posts) || posts.length === 0) {
+    return false;
+  }
+
+  const oldestPostDate = Math.min(...posts.map((post) => Number(post.date || 0)));
+
+  return oldestPostDate >= horizonStart;
+}
+
+function getPublishedReservationScanCandidates(posts, now = Math.floor(Date.now() / 1000), graceDays = RESERVATION_GRACE_DAYS) {
+  return posts.filter((post) => post.status === 'published' && shouldScanReservationsPost(post, now, graceDays));
+}
+
+async function getRecentWallPosts(limit = 3, offset = 0) {
   const response = await vkQueue('wall.get', {
     owner_id: -Math.abs(GROUP_ID),
     count: limit,
+    offset,
   });
 
   await sleep(1000);
 
   return response.items || [];
+}
+
+async function getRecentWallPostsWithinReservationHorizon(options = {}) {
+  const now = options.now || Math.floor(Date.now() / 1000);
+  const graceDays = options.graceDays ?? RESERVATION_GRACE_DAYS;
+  const pageSize = options.pageSize || WALL_SYNC_PAGE_SIZE;
+  const maxPages = options.maxPages || WALL_SYNC_MAX_PAGES;
+  const horizonStart = getPublishedRouletteSyncHorizon(now, graceDays);
+  const posts = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const pagePosts = await getRecentWallPosts(pageSize, page * pageSize);
+    posts.push(...pagePosts);
+
+    if (!shouldContinueWallPagination(pagePosts, horizonStart)) {
+      break;
+    }
+  }
+
+  return posts.filter((post) => Number(post.date || 0) >= horizonStart);
 }
 
 async function getWallPostById(postId) {
@@ -664,16 +705,19 @@ async function getWallPostById(postId) {
 }
 
 async function syncRecentRoulettePosts() {
-  const posts = await getRecentWallPosts(20);
+  const posts = await getRecentWallPostsWithinReservationHorizon();
   const roulettePosts = posts.filter(isRoulettePost);
   const syncedPostIds = [];
+  const stats = {
+    wallPostsChecked: posts.length,
+    roulettePostsFound: roulettePosts.length,
+    newRealPostsImported: 0,
+    existingRealPosts: 0,
+  };
 
-  console.log(`Recent wall posts checked: ${posts.length}`);
-  console.log(`Roulette posts found: ${roulettePosts.length}`);
-
-  if (roulettePosts.length === 0) {
-    console.log('Recent roulette posts not found in last 20 wall posts');
-  }
+  console.log('REAL POST SYNC:');
+  console.log(`wall_posts_checked: ${stats.wallPostsChecked}`);
+  console.log(`roulette_posts_found: ${stats.roulettePostsFound}`);
 
   for (const post of roulettePosts) {
     let items = buildImportedPostItems(post);
@@ -694,9 +738,11 @@ async function syncRecentRoulettePosts() {
     syncedPostIds.push(post.id);
 
     if (result.saved) {
+      stats.newRealPostsImported += 1;
       console.log(`Imported post ${post.id}: ${items.length} items`);
       markPostItemsState(post.id, 'published', post.date);
     } else if (result.reason === 'duplicate') {
+      stats.existingRealPosts += 1;
       console.log(`Post ${post.id} already exists, skipped`);
       markScheduledPostPublished(post.id, post.date);
       const existingItems = getPostItems(post.id);
@@ -714,7 +760,13 @@ async function syncRecentRoulettePosts() {
     await waitToAvoidVkRateLimit(2000);
   }
 
-  return syncedPostIds;
+  console.log(`new_real_posts_imported: ${stats.newRealPostsImported}`);
+  console.log(`existing_real_posts: ${stats.existingRealPosts}`);
+
+  return {
+    syncedPostIds,
+    ...stats,
+  };
 }
 
 async function reimportPostItems(postId) {
@@ -737,7 +789,16 @@ async function reimportPostItems(postId) {
 }
 
 async function fixRecentReservations() {
-  await fixReservations();
+  await syncRecentRoulettePosts();
+
+  const now = Math.floor(Date.now() / 1000);
+  const posts = getPublishedReservationScanCandidates(listPostsForReservationFix(), now);
+
+  console.log('');
+  console.log('RESERVATION SCAN:');
+  console.log(`published_posts_due: ${posts.length}`);
+
+  await fixReservations(posts);
 }
 
 function parseReservationItemNumbers(text = '') {
@@ -3305,6 +3366,9 @@ module.exports = {
   isCommentWithinReservationWindow,
   shouldMarkReservationsChecked,
   shouldScanReservationsPost,
+  getPublishedRouletteSyncHorizon,
+  shouldContinueWallPagination,
+  getPublishedReservationScanCandidates,
   getGraceReopenCandidates,
   buildReservationTasksForComment,
   makeReservationIdentity,

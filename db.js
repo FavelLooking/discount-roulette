@@ -920,7 +920,7 @@ function listPostsForReservationFix() {
       gold_position,
       product_fingerprint
     FROM scheduled_posts
-    WHERE status IN ('scheduled', 'published')
+    WHERE status = 'published'
       AND reservations_checked_at IS NULL
       AND publish_date + 24 * 60 * 60 <= ?
     ORDER BY publish_date ASC, id ASC
@@ -1001,7 +1001,7 @@ function listPostsForReservationFixByIds(vkPostIds) {
       gold_position,
       product_fingerprint
     FROM scheduled_posts
-    WHERE status IN ('scheduled', 'published')
+    WHERE status = 'published'
       AND vk_post_id IN (${placeholders})
     ORDER BY publish_date DESC, id DESC
   `).all(...vkPostIds);

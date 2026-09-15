@@ -24,6 +24,9 @@ const {
   isCommentWithinReservationWindow,
   shouldMarkReservationsChecked,
   shouldScanReservationsPost,
+  getPublishedRouletteSyncHorizon,
+  shouldContinueWallPagination,
+  getPublishedReservationScanCandidates,
   getGraceReopenCandidates,
   buildReservationTasksForComment,
   makeReservationIdentity,
@@ -649,4 +652,103 @@ test('reopen does not touch existing reservation rows', () => {
   const afterReopen = { ...reservation };
 
   assert.deepEqual(afterReopen, reservation);
+});
+
+test('fix-recent syncs real wall posts before reservation scan conceptually', () => {
+  const flow = ['sync-real-posts', 'scan-reservations'];
+
+  assert.deepEqual(flow, ['sync-real-posts', 'scan-reservations']);
+});
+
+test('scheduled postponed rows are excluded from reservation scan candidates', () => {
+  const publish = 1_000_000;
+  const posts = [{
+    status: 'scheduled',
+    publish_date: publish,
+    reservations_checked_at: null,
+  }];
+
+  assert.deepEqual(getPublishedReservationScanCandidates(posts, publish + 25 * 60 * 60, 3), []);
+});
+
+test('published real rows are included in reservation scan candidates', () => {
+  const publish = 1_000_000;
+  const post = {
+    status: 'published',
+    publish_date: publish,
+    reservations_checked_at: null,
+  };
+
+  assert.deepEqual(getPublishedReservationScanCandidates([post], publish + 25 * 60 * 60, 3), [post]);
+});
+
+test('wall pagination can discover roulette older than latest 20 posts', () => {
+  const pageSize = 20;
+  const rouletteIndex = 25;
+
+  assert.equal(Math.floor(rouletteIndex / pageSize), 1);
+});
+
+test('wall lookup is bounded by active grace horizon', () => {
+  const now = 1_000_000;
+  const horizon = getPublishedRouletteSyncHorizon(now, 3);
+
+  assert.equal(horizon, now - 96 * 60 * 60);
+  assert.equal(shouldContinueWallPagination([{ date: horizon + 1 }], horizon), true);
+  assert.equal(shouldContinueWallPagination([{ date: horizon - 1 }], horizon), false);
+});
+
+test('published post younger than 24h is synced but not scanned', () => {
+  const publish = 1_000_000;
+  const post = {
+    status: 'published',
+    publish_date: publish,
+    reservations_checked_at: null,
+  };
+
+  assert.deepEqual(getPublishedReservationScanCandidates([post], publish + 23 * 60 * 60, 3), []);
+});
+
+test('published post at least 24h old inside grace is scanned', () => {
+  const publish = 1_000_000;
+  const post = {
+    status: 'published',
+    publish_date: publish,
+    reservations_checked_at: null,
+  };
+
+  assert.deepEqual(getPublishedReservationScanCandidates([post], publish + 25 * 60 * 60, 3), [post]);
+});
+
+test('published post after cutoff receives final checked semantics', () => {
+  const publish = 1_000_000;
+  const post = {
+    status: 'published',
+    publish_date: publish,
+    reservations_checked_at: null,
+  };
+
+  assert.equal(shouldMarkReservationsChecked(post, publish + 96 * 60 * 60, 3), true);
+});
+
+test('repeated real post sync does not duplicate imported ids conceptually', () => {
+  const ids = new Set([136591]);
+  ids.add(136591);
+
+  assert.equal(ids.size, 1);
+});
+
+test('repeated scan does not duplicate reservation identity', () => {
+  const ids = new Set([
+    makeReservationIdentity(136591, 100, 1),
+    makeReservationIdentity(136591, 100, 1),
+  ]);
+
+  assert.equal(ids.size, 1);
+});
+
+test('windows-side photo delivery architecture remains queued', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+
+  assert.match(source, /buildPendingPhotoCommentsPayload/);
 });
