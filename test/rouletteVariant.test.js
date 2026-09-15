@@ -16,6 +16,7 @@ const {
   buildReservationRecord,
   buildPhotoReservationCommentText,
   buildPhotoReservationCommentRequest,
+  buildPendingPhotoCommentsPayload,
   deliverReservationPhotoComment,
   parseReservationItemNumbers,
   parseReservationItemNumber,
@@ -28,6 +29,33 @@ const {
   makeReservationIdentity,
   publicPostCopyIncludesOnly24Hours,
 } = require('../index');
+
+test('pending photo-comment JSON payload is a strict token-free whitelist', () => {
+  const payload = buildPendingPhotoCommentsPayload([{
+    id: 78,
+    vk_post_id: 132996,
+    comment_id: 136578,
+    item_number: 8,
+    user_name: 'Alexander Ignashkin',
+    display_name: 'Alexander Ignashkin',
+    photo_owner_id: -57561517,
+    photo_id: 457347167,
+    photo_attachment: 'photo-57561517_457347167',
+    discount_price: 360,
+    photo_comment_guid: 'stable-guid',
+    access_token: 'must-not-leak',
+  }]);
+
+  assert.equal(payload.length, 1);
+  assert.equal(Object.hasOwn(payload[0], 'access_token'), false);
+  assert.equal(JSON.stringify(payload).includes('must-not-leak'), false);
+});
+
+test('production reservation path queues Windows delivery instead of remote VK delivery', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.match(source, /Photo comment queued for Windows delivery/);
+  assert.match(source, /REMOTE PHOTO COMMENT DELIVERY DISABLED/);
+});
 
 function makeItems(count = 8) {
   return Array.from({ length: count }, (_, index) => ({

@@ -1617,7 +1617,7 @@ function ensureReservationPhotoCommentGuid(reservationId, guid) {
 }
 
 function markReservationPhotoCommentSent(reservationId, commentId, sentAt = Math.floor(Date.now() / 1000)) {
-  db.prepare(`
+  const result = db.prepare(`
     UPDATE reservations
     SET
       photo_comment_status = 'sent',
@@ -1626,16 +1626,18 @@ function markReservationPhotoCommentSent(reservationId, commentId, sentAt = Math
       photo_comment_last_error = NULL
     WHERE id = ?
   `).run(commentId, sentAt, reservationId);
+  return { updated: result.changes === 1 };
 }
 
 function markReservationPhotoCommentFailed(reservationId, errorMessage) {
-  db.prepare(`
+  const result = db.prepare(`
     UPDATE reservations
     SET
       photo_comment_status = 'failed_retryable',
       photo_comment_last_error = ?
     WHERE id = ?
   `).run(String(errorMessage || '').slice(0, 1000), reservationId);
+  return { updated: result.changes === 1 };
 }
 
 function listBackfillablePhotoCommentReservations(sinceTimestamp) {

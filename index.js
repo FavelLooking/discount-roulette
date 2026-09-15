@@ -1070,18 +1070,55 @@ function importQueueStateFromFile(inputPath) {
 }
 
 async function syncPhotoComments() {
-  const reservations = listPendingPhotoCommentReservations();
+  throw new Error(
+    'REMOTE PHOTO COMMENT DELIVERY DISABLED: IP-bound USER token writes run on Windows.'
+  );
+}
 
-  console.log(`SYNC PHOTO COMMENTS ${DRY_RUN ? 'DRY-RUN' : 'REAL RUN'}`);
-  console.log(`pending reservations: ${reservations.length}`);
+function buildPendingPhotoCommentsPayload(reservations = listPendingPhotoCommentReservations()) {
+  return reservations.map((reservation) => {
+    if (!reservation.photo_comment_guid) {
+      throw new Error(
+        `Reservation ${reservation.id} is missing persisted photo_comment_guid.`
+      );
+    }
+    return {
+      id: reservation.id,
+      vk_post_id: reservation.vk_post_id,
+      comment_id: reservation.comment_id,
+      item_number: reservation.item_number,
+      user_name: reservation.user_name || '',
+      display_name: reservation.display_name || reservation.user_name || '',
+      photo_owner_id: reservation.photo_owner_id,
+      photo_id: reservation.photo_id,
+      photo_attachment: reservation.photo_attachment,
+      discount_price: reservation.discount_price,
+      photo_comment_guid: reservation.photo_comment_guid,
+    };
+  });
+}
 
-  if (reservations.length === 0) {
-    return;
+function parsePositiveCliId(value, name) {
+  const resolved = Number(value);
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
   }
+  return resolved;
+}
 
-  for (const reservation of reservations) {
-    await deliverReservationPhotoComment(reservation);
-  }
+function readFailureTextFromStdin(maxChars = 1000) {
+  return new Promise((resolve, reject) => {
+    process.stdin.setEncoding('utf8');
+    let text = '';
+    process.stdin.on('data', (chunk) => {
+      text += chunk;
+      if (text.length > maxChars + 2) {
+        reject(new Error('Failure text on stdin is too long.'));
+      }
+    });
+    process.stdin.on('error', reject);
+    process.stdin.on('end', () => resolve(text.trim().slice(0, maxChars)));
+  });
 }
 
 function parseBackfillSince(value) {
@@ -1533,12 +1570,19 @@ async function fixReservations(postsOverride = null) {
           item,
           mode: DRY_RUN ? 'Would save confirmed reservation' : 'Confirmed reservation',
         });
-        await deliverReservationPhotoComment({
-          ...reservation,
-          id: deliveryReservationId,
-          photoOwnerId: item.photo_owner_id,
-          photoId: item.photo_id,
-        });
+        if (DRY_RUN) {
+          await deliverReservationPhotoComment({
+            ...reservation,
+            id: deliveryReservationId,
+            photoOwnerId: item.photo_owner_id,
+            photoId: item.photo_id,
+          });
+        } else if (deliveryReservationId) {
+          ensureReservationPhotoCommentGuid(deliveryReservationId, crypto.randomUUID());
+          console.log(
+            `Photo comment queued for Windows delivery: reservation ${deliveryReservationId}`
+          );
+        }
         stats.confirmed += 1;
       }
     }
@@ -2974,7 +3018,37 @@ async function printQueueState() {
 }
 
 async function main() {
-  const [command, commandArg] = process.argv.slice(2);
+  const [command, commandArg, commandArg2] = process.argv.slice(2);
+
+  if (command === 'pending-photo-comments-json') {
+    process.stdout.write(`${JSON.stringify(buildPendingPhotoCommentsPayload())}\n`);
+    return;
+  }
+
+  if (command === 'mark-photo-comment-sent') {
+    const reservationId = parsePositiveCliId(commandArg, 'RESERVATION_ID');
+    const commentId = parsePositiveCliId(commandArg2, 'COMMENT_ID');
+    const result = markReservationPhotoCommentSent(reservationId, commentId);
+    if (!result.updated) {
+      throw new Error(`Reservation ${reservationId} not found.`);
+    }
+    console.log('PHOTO COMMENT MARKED SENT');
+    return;
+  }
+
+  if (command === 'mark-photo-comment-failed') {
+    const reservationId = parsePositiveCliId(commandArg, 'RESERVATION_ID');
+    const errorText = await readFailureTextFromStdin();
+    if (!errorText) {
+      throw new Error('Failure text is required on stdin.');
+    }
+    const result = markReservationPhotoCommentFailed(reservationId, errorText);
+    if (!result.updated) {
+      throw new Error(`Reservation ${reservationId} not found.`);
+    }
+    console.log('PHOTO COMMENT MARKED FAILED_RETRYABLE');
+    return;
+  }
 
   if (command === 'list') {
     printScheduledPostsList();
@@ -3219,6 +3293,7 @@ module.exports = {
   buildReservationRecord,
   buildPhotoReservationCommentText,
   buildPhotoReservationCommentRequest,
+  buildPendingPhotoCommentsPayload,
   deliverReservationPhotoComment,
   createPreviewImage,
   buildScheduledPostPlans,
